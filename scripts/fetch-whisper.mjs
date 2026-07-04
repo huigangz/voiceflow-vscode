@@ -95,7 +95,7 @@ function main() {
     copied++;
   }
   console.log(`[fetch-whisper] OK: ${copied} 个 whisper 文件已就位并逐一 SHA 校验通过 → ${binDir}`);
-  console.log('[fetch-whisper] 提示:voiceflow-mic.exe 由 npm run build:helper 产出(不在此脚本范围)');
+  console.log('[fetch-whisper] 提示:voiceflow-mic.exe 由 npm run build:helper(拷贝 prebuilt/)放置');
 }
 
 await ensureArchive();

@@ -182,7 +182,8 @@
   },
   "scripts": {
     "assets": "node scripts/copy-assets.mjs",
-    "build:helper": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize /out:bin\\voiceflow-mic.exe helper\\MicCapture.cs",
+    "build:helper": "node scripts/place-helper.mjs",
+    "build:helper:compile": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize /out:prebuilt\\voiceflow-mic.exe helper\\MicCapture.cs",
     "build:whisper": "node scripts/fetch-whisper.mjs",
     "build:fixtures": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /out:test\\fixtures\\silent-helper.exe test\\fixtures\\SilentHelper.cs",
     "verify-bin": "node scripts/verify-bin.mjs",

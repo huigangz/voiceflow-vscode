@@ -1,5 +1,5 @@
 {
-  "_comment": "bin/ 内容的权威清单(source of truth)。bin/ 本身 gitignored,由 fetch-whisper.mjs + build:helper 产出;verify-bin.mjs 据此做精确集合 + 分层校验。修改仅限:whisper 版本升级、BLAS/no-BLAS 决策变更。普通构建不得自动改写本文件。",
+  "_comment": "bin/ 内容的权威清单(source of truth)。bin/ 本身 gitignored,由 fetch-whisper.mjs(whisper)+ place-helper.mjs(拷贝固定的 prebuilt/voiceflow-mic.exe)产出;verify-bin.mjs 据此做精确集合 + 逐文件 SHA-256 校验。voiceflow-mic.exe 已改为**固定预编译**(prebuilt/,不每次重编译)→ 哈希稳定、可 SHA 固定、且能被 Smart App Control 养熟放行。修改仅限:whisper 版本升级、BLAS 决策、helper 源码变更(需 build:helper:compile 更新 prebuilt + 本 SHA + 重新养熟)。普通构建不得自动改写本文件。",
   "_decision": "P1-A 用 bench-server.mjs 实测:no-BLAS 与 BLAS 的 small warm 延迟一致(P50 ~3.1s / P95 ~3.3s,均 << 10s/15s 阈值)、输出逐字一致;no-BLAS 省 48MB(VSIX 61MB→~13MB)且不再分发 OpenBLAS(消除 BSD-3-Clause 义务)。故采用 no-BLAS。cold start 略高(8.5s vs 2s)但一次性、不计入 §8.1 延迟指标。",
   "whisperSource": {
     "repo": "ggml-org/whisper.cpp",
@@ -11,7 +11,7 @@
     "archiveSize": 7982101
   },
   "files": {
-    "voiceflow-mic.exe": { "source": "build:helper", "verify": "format" },
+    "voiceflow-mic.exe": { "source": "prebuilt", "sha256": "8cf36f8f1bdf2e82770ba919591731eecbe99ce10b2816077d08c69e46576b98" },
     "whisper-cli.exe": { "source": "whisper", "sha256": "58245314fb73b30fbd0cf0542c5c172e23f02b6eb7cad7b51e792439cf5e1755" },
     "whisper-server.exe": { "source": "whisper", "sha256": "2c1ef08694756eda280e79b8217da63ee2af33c87ac3d5f27d68f9f3f966fd32" },
     "whisper.dll": { "source": "whisper", "sha256": "b31690c12461517fe9774e61318ab63a69972b948151feed98b913be35f708b6" },

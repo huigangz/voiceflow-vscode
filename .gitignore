@@ -9,3 +9,4 @@ models/
 worklog/
 test/fixtures/*.exe
 voiceflow-phase1-plan.md
+voiceflow-vscode-spec-*.md

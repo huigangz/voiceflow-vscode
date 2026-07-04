@@ -3,6 +3,7 @@
 .claude/**
 .gitignore
 media/**
+prebuilt/**
 bin.manifest.json
 voiceflow-phase1-plan.md
 src/**
