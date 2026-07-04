@@ -1,0 +1,18 @@
+# 只打包运行所需:dist(bundled)+ media(webview 资产)+ bin(whisper 二进制,打包阶段放入)
+.vscode/**
+.claude/**
+.gitignore
+src/**
+test/**
+helper/**
+scripts/**
+worklog/**
+node_modules/**
+esbuild.mjs
+tsconfig.json
+*.map
+dist/*.map
+voiceflow-vscode-spec-*.md
+CLAUDE.md
+models/**
+*.vsix

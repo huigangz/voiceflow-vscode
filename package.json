@@ -1,0 +1,204 @@
+{
+  "name": "voiceflow-vscode",
+  "displayName": "VoiceFlow",
+  "description": "Wispr Flow 式本地语音听写:按键说话,本地 whisper 转写,清理后插入编辑器或终端。音频永不离开本机。",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "voiceflow-preview",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "voiceflow.toggleDictation",
+        "title": "VoiceFlow: Toggle Dictation (开始/结束听写)"
+      },
+      {
+        "command": "voiceflow.cancelSession",
+        "title": "VoiceFlow: Cancel Session (取消整个会话)"
+      },
+      {
+        "command": "voiceflow.downloadModel",
+        "title": "VoiceFlow: Download / Switch Model (下载或切换模型)"
+      },
+      {
+        "command": "voiceflow.openSetupWizard",
+        "title": "VoiceFlow: Setup Wizard (首次启动向导)"
+      },
+      {
+        "command": "voiceflow.showLogs",
+        "title": "VoiceFlow: Show Logs (查看日志)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "voiceflow.toggleDictation",
+        "key": "ctrl+alt+l",
+        "args": {
+          "focus": "none"
+        }
+      },
+      {
+        "command": "voiceflow.toggleDictation",
+        "key": "ctrl+alt+l",
+        "when": "editorTextFocus",
+        "args": {
+          "focus": "editor"
+        }
+      },
+      {
+        "command": "voiceflow.toggleDictation",
+        "key": "ctrl+alt+l",
+        "when": "terminalFocus",
+        "args": {
+          "focus": "terminal"
+        }
+      },
+      {
+        "command": "voiceflow.cancelSession",
+        "key": "escape",
+        "when": "voiceflow.sessionActive"
+      }
+    ],
+    "configuration": {
+      "title": "VoiceFlow",
+      "properties": {
+        "voiceflow.language": {
+          "type": "string",
+          "enum": [
+            "zh",
+            "en",
+            "auto"
+          ],
+          "default": "zh",
+          "description": "听写语言。zh=中文(含中英混合),en=英文,auto=自动检测。"
+        },
+        "voiceflow.model": {
+          "type": "string",
+          "enum": [
+            "base",
+            "small",
+            "small-q5",
+            "large-v3-turbo-q5",
+            "large-v3-turbo"
+          ],
+          "default": "small",
+          "description": "whisper 模型档位(默认档位待 P2 实测收敛;当前占位 small)。"
+        },
+        "voiceflow.cleanup.provider": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "rules-only",
+            "claude-cli",
+            "codex-cli"
+          ],
+          "default": "auto",
+          "description": "清理 provider。auto=规则层+vscode.lm(可用则用);rules-only=文本不出本机;CLI 需显式选择。"
+        },
+        "voiceflow.cleanup.timeout": {
+          "type": "number",
+          "default": 8000,
+          "description": "LLM 清理超时(ms),超时后直接插入规则层结果。"
+        },
+        "voiceflow.recorder": {
+          "type": "string",
+          "enum": ["helper", "webview"],
+          "default": "helper",
+          "description": "录音实现。helper=native helper exe(默认,P3 结论);webview=实验性(上游 VS Code 暂不支持 webview 麦克风,microsoft/vscode#250568)。"
+        },
+        "voiceflow.recording.maxDuration": {
+          "type": "number",
+          "default": 120,
+          "description": "最大录音时长(秒),到时自动结束。"
+        },
+        "voiceflow.recording.autoStopSilence": {
+          "type": "number",
+          "default": 3,
+          "description": "VAD 连续静音自动结束(秒),0=关闭。仅在已有语音段后生效。"
+        },
+        "voiceflow.recording.confirmThreshold": {
+          "type": "number",
+          "default": 30,
+          "description": "录音超过该秒数,插入前进行 lightweight 确认;0=关闭。"
+        },
+        "voiceflow.whisper.binaryDir": {
+          "type": "string",
+          "default": "",
+          "description": "whisper.cpp 二进制目录(含 whisper-server.exe / whisper-cli.exe)。留空 = 使用扩展内置 bin/ 目录(打包阶段内置)。"
+        },
+        "voiceflow.whisper.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "server",
+            "cli"
+          ],
+          "default": "auto",
+          "description": "whisper 运行形态(P1 待 S2 实测收敛)。auto=有 server 二进制则 server,否则 CLI。"
+        },
+        "voiceflow.whisper.idleUnload": {
+          "type": "number",
+          "default": 10,
+          "description": "模型空闲自动卸载(分钟),0=常驻。"
+        },
+        "voiceflow.rules.convertToSimplified": {
+          "type": "boolean",
+          "default": true,
+          "description": "规则层:繁体转简体。"
+        },
+        "voiceflow.rules.spacingCJKLatin": {
+          "type": "boolean",
+          "default": true,
+          "description": "规则层:中英文之间加空格。"
+        },
+        "voiceflow.rules.normalizePunctuation": {
+          "type": "boolean",
+          "default": true,
+          "description": "规则层:常见全角/半角标点归一。"
+        },
+        "voiceflow.rules.collapseSpaces": {
+          "type": "boolean",
+          "default": true,
+          "description": "规则层:去除重复空格。"
+        },
+        "voiceflow.rules.stripHallucinations": {
+          "type": "boolean",
+          "default": true,
+          "description": "规则层:去除 whisper 常见尾部幻觉(如“谢谢观看”)。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "assets": "node scripts/copy-assets.mjs",
+    "build:helper": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize /out:bin\\voiceflow-mic.exe helper\\MicCapture.cs",
+    "build": "node scripts/copy-assets.mjs && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "package": "vsce package --target win32-x64"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@ricky0123/vad-web": "^0.0.30",
+    "opencc-js": "^1.4.0"
+  }
+}
