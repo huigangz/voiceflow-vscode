@@ -7,3 +7,4 @@ dist/
 models/
 *.wav
 worklog/
+test/fixtures/*.exe

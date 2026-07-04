@@ -8,6 +8,7 @@ import { HelperRecorder } from '../src/audio/helperRecorder';
 import { PcmChunk, RecorderError } from '../src/audio/recorder';
 
 const EXE = 'bin/voiceflow-mic.exe';
+const SILENT = 'test/fixtures/silent-helper.exe';
 
 describe.skipIf(!existsSync(EXE))('HelperRecorder(真实 helper 进程)', () => {
   it('start → 收到 PCM 帧 → stop 干净退出', async () => {
@@ -54,5 +55,23 @@ describe.skipIf(!existsSync(EXE))('HelperRecorder(真实 helper 进程)', () => 
     await new Promise((r) => setTimeout(r, 500));
     // dispose 后不应再有活动进程(kill 已发出;无法直接断言 PID,靠 stop 不挂起验证)
     await rec.stop(); // 应立即返回
+  }, 10000);
+});
+
+// device-lost watchdog:READY 后数据断流 → 判定 device-lost 并 kill 挂起 helper
+// (模拟 winmm 设备拔出后静默挂起;不依赖 helper 自己报错)
+describe.skipIf(!existsSync(SILENT))('HelperRecorder 数据流 watchdog', () => {
+  it('READY 后持续无数据 → onError(device-lost),且进程被杀', async () => {
+    const rec = new HelperRecorder(SILENT, () => {});
+    const err = await new Promise<RecorderError>((resolve, reject) => {
+      // start() 会 resolve(收到 READY),device-lost 通过 onError 异步上报
+      rec.start({
+        onChunk: () => {},
+        onSpeechStart: () => {},
+        onError: (e) => resolve(e),
+      }).catch(reject);
+    });
+    expect(err.code).toBe('device-lost');
+    await rec.stop(); // 已被 watchdog kill,应立即返回不挂起
   }, 10000);
 });

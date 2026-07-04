@@ -187,6 +187,7 @@
   "scripts": {
     "assets": "node scripts/copy-assets.mjs",
     "build:helper": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize /out:bin\\voiceflow-mic.exe helper\\MicCapture.cs",
+    "build:fixtures": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /out:test\\fixtures\\silent-helper.exe test\\fixtures\\SilentHelper.cs",
     "build": "node scripts/copy-assets.mjs && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",

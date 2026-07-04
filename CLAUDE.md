@@ -54,7 +54,7 @@ test/                       # vitest 单元测试
 
 ## 开发流程约定
 
-- **当前阶段:最小闭环已实测通过(2026-07-03)—— 项目成立**。录音(helper exe)→ 模型下载(small)→ whisper server(CPU/BLAS)→ rules+vscode.lm 清理 → editor 插入全链路在用户机器上验证通过;77 条单元测试绿。**P1(server)/P2(small)/P3(helper exe)全部锁定,语言默认 auto(均为 2026-07-03/04 实测数据驱动)**。剩余:S1 核心三连(拔设备/锁屏/Reload 残留)、S4b terminal/Remote 清单、噪音场景 turbo-q5 对比(可选)、fresh-install 产品 gate。gate 实测已修的坑见各 worklog"Gate 实测发现"节(首下载 ENOENT、webview 无麦克风→helper、LLM 拒绝防线)
+- **当前阶段:最小闭环已实测通过(2026-07-03)—— 项目成立**。录音(helper exe)→ 模型下载(small)→ whisper server(CPU/BLAS)→ rules+vscode.lm 清理 → editor 插入全链路在用户机器上验证通过;77 条单元测试绿。**P1(server)/P2(small)/P3(helper exe)全部锁定,语言默认 auto(均为 2026-07-03/04 实测数据驱动)**。**Phase 0 技术 gate 完整达成(2026-07-04)**:S1 核心三连全绿(拔设备/Reload 零残留/锁屏解锁,helper watchdog 加固)、S4b terminal/clipboard 五项全过、S4a editor 闭环、S2 质量+延迟达标。§9.3 技术 gate(序 1-3 必绿)满足。剩余非阻塞项:Remote/WSL 验证(限制写 README)、噪音场景 turbo-q5 对比(可选升档)、fresh-install 产品 gate(前置:whisper 二进制内置 VSIX)。**下一步进 Phase 1 产品化**。gate 实测已修的坑见各 worklog"Gate 实测发现"节(首下载 ENOENT、webview 无麦克风→helper、LLM 拒绝防线)
 - 每个 step 完成后在 `worklog/` 写一篇日志:做了什么、gate 状态(自动测试结果 + 人工测试清单)、待定决策进展(P1/P2/P3)
 - 硬件相关 gate(麦克风、GPU、锁屏、拔设备、Reload Window)无法自动化 → 写成人工测试清单,由用户在 Extension Development Host 中执行
 - 构建:`npm run build`(esbuild);测试:`npm test`(vitest);调试:F5 启动 Extension Development Host

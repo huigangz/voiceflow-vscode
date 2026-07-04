@@ -13,6 +13,9 @@ import { Recorder, RecorderError, RecorderErrorCode, RecorderEvents } from './re
 
 const READY_TIMEOUT_MS = 5000;
 const STOP_GRACE_MS = 2000;
+// 数据流水位:helper 每 ~100ms 发一帧(即使静音)。READY 后持续无数据 =
+// 设备被拔出/切换后 winmm 静默挂起(经典行为:不报错、不退出)→ 判定 device-lost。
+const DATA_WATCHDOG_MS = 1500;
 
 function mapExitCode(code: number | null, stderrTail: string): RecorderError {
   if (code === 2) return new RecorderError('no-device', '未找到麦克风设备');
@@ -31,6 +34,7 @@ export class HelperRecorder implements Recorder {
   public mode = 'helper-energy';
   private proc: ChildProcess | undefined;
   private stopping = false;
+  private watchdog: NodeJS.Timeout | undefined;
 
   constructor(
     private readonly exePath: string,
@@ -41,6 +45,7 @@ export class HelperRecorder implements Recorder {
     const vad = new EnergyVad();
     let speechAnnounced = false;
     let stderrTail = '';
+    let ready = false;
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -56,6 +61,22 @@ export class HelperRecorder implements Recorder {
         READY_TIMEOUT_MS,
       );
 
+      // 录音中数据断流 → device-lost(winmm 静默挂起兜底,不依赖 helper 报错)
+      const raiseDeviceLost = () => {
+        if (this.stopping) return;
+        this.clearWatchdog();
+        const err = new RecorderError('device-lost', '录音设备数据中断(可能被拔出或切换)');
+        this.log(`[recorder] ${err.message} — watchdog`);
+        this.stopping = true;
+        this.proc?.kill();
+        events.onError(err);
+      };
+      const kickWatchdog = () => {
+        if (this.stopping) return;
+        this.clearWatchdog();
+        this.watchdog = setTimeout(raiseDeviceLost, DATA_WATCHDOG_MS);
+      };
+
       let proc: ChildProcess;
       try {
         proc = spawn(this.exePath, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
@@ -66,8 +87,13 @@ export class HelperRecorder implements Recorder {
       this.proc = proc;
 
       proc.on('error', (err: NodeJS.ErrnoException) => {
-        const code: RecorderErrorCode = err.code === 'ENOENT' ? 'init-failed' : 'init-failed';
-        const rerr = new RecorderError(code, `helper 启动失败:${err.message}(路径 ${this.exePath})`);
+        // exe 缺失/无法执行 = 安装损坏,归 init-failed(非 no-device:设备与此无关)
+        const code: RecorderErrorCode = 'init-failed';
+        const rerr = new RecorderError(
+          code,
+          `helper 启动失败:${err.message}(路径 ${this.exePath})`,
+        );
+        this.clearWatchdog();
         settle(() => reject(rerr));
         if (settled) events.onError(rerr);
       });
@@ -76,7 +102,9 @@ export class HelperRecorder implements Recorder {
         stderrTail = (stderrTail + d).slice(-500);
         for (const line of d.split(/\r?\n/)) {
           if (line.startsWith('READY')) {
+            ready = true;
             this.log(`[recorder] helper ready: ${line.trim()}`);
+            kickWatchdog(); // READY 后必须开始来数据,否则判 device-lost
             settle(resolve);
           } else if (line.trim().length > 0) {
             this.log(`[helper] ${line.trim()}`);
@@ -87,6 +115,7 @@ export class HelperRecorder implements Recorder {
       // 注意:不按 stopping 丢帧 —— stop() 后 helper 仍会冲刷尾部缓冲(用户最后的词),
       // 数据流以进程 close 为自然终点
       proc.stdout!.on('data', (data: Buffer) => {
+        if (ready) kickWatchdog(); // 每帧刷新水位;断流 1.5s → device-lost
         for (const chunk of vad.push(data)) {
           if (chunk.isSpeech && !speechAnnounced) {
             speechAnnounced = true;
@@ -98,7 +127,8 @@ export class HelperRecorder implements Recorder {
 
       proc.on('close', (code) => {
         if (this.proc === proc) this.proc = undefined;
-        if (this.stopping) return; // 正常停止路径由 stop() 处理
+        this.clearWatchdog();
+        if (this.stopping) return; // 正常停止 / watchdog 已处理
         const err = mapExitCode(code, stderrTail.trim());
         this.log(`[recorder] helper exited unexpectedly: ${err.code} — ${err.message}`);
         settle(() => reject(err));
@@ -107,11 +137,19 @@ export class HelperRecorder implements Recorder {
     });
   }
 
+  private clearWatchdog(): void {
+    if (this.watchdog !== undefined) {
+      clearTimeout(this.watchdog);
+      this.watchdog = undefined;
+    }
+  }
+
   /** 正常结束:stdin EOF → helper 冲刷尾部缓冲后退出;超时兜底 kill。 */
   async stop(): Promise<void> {
     const proc = this.proc;
     if (!proc) return;
     this.stopping = true;
+    this.clearWatchdog();
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
         proc.kill();
@@ -129,6 +167,7 @@ export class HelperRecorder implements Recorder {
   /** Reload Window gate:kill 子进程,无残留。 */
   dispose(): void {
     this.stopping = true;
+    this.clearWatchdog();
     this.proc?.kill();
     this.proc = undefined;
   }
