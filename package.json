@@ -194,7 +194,9 @@
     "test": "vitest run",
     "bench": "node scripts/bench-server.mjs",
     "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
-    "package": "vsce package --target win32-x64"
+    "package": "vsce package --target win32-x64",
+    "stage-model": "node scripts/stage-bundled-model.mjs",
+    "package:bundled": "node scripts/stage-bundled-model.mjs && vsce package --target win32-x64 -o voiceflow-vscode-win32-x64-0.1.1-offline.vsix && node scripts/stage-bundled-model.mjs --clean"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

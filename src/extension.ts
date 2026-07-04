@@ -49,7 +49,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // Reload Window gate:清理上次会话可能残留的临时 WAV
   void cleanTmpWavs(context.globalStorageUri, log);
 
-  modelManager = new ModelManager(context.globalStorageUri, log);
+  // offline VSIX(B 方案):内置模型放 extensionUri/offline-model;存在则运行时零下载
+  modelManager = new ModelManager(
+    context.globalStorageUri,
+    log,
+    vscode.Uri.joinPath(context.extensionUri, 'offline-model'),
+  );
 
   context.subscriptions.push(
     output,

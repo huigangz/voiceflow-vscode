@@ -5,6 +5,7 @@ dist/
 *.vsix
 .vscode-test/
 models/
+offline-model/
 *.wav
 worklog/
 test/fixtures/*.exe

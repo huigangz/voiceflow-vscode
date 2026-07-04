@@ -62,33 +62,61 @@ export class ModelManager {
   constructor(
     private readonly storageUri: vscode.Uri,
     private readonly log: (line: string) => void,
+    /**
+     * 可选:随扩展打包的离线模型目录(offline build,B 方案)。
+     * = extensionUri/offline-model。存在对应 .bin 则直接使用,运行时零下载。
+     */
+    private readonly bundledModelsUri?: vscode.Uri,
   ) {}
 
   modelDir(): vscode.Uri {
     return vscode.Uri.joinPath(this.storageUri, 'models');
   }
 
+  /** globalStorage 下的目标路径(下载/手动导入位置)。 */
   modelPath(tier: ModelTier): vscode.Uri {
     return vscode.Uri.joinPath(this.modelDir(), MODELS[tier].fileName);
   }
 
-  async isDownloaded(tier: ModelTier): Promise<boolean> {
+  private async statSize(uri: vscode.Uri): Promise<number> {
     try {
-      const st = await vscode.workspace.fs.stat(this.modelPath(tier));
-      return st.size > 0;
+      return (await vscode.workspace.fs.stat(uri)).size;
     } catch {
-      return false;
+      return 0;
     }
   }
 
   /**
-   * 确保模型可用:已下载直接返回;否则带进度/可取消地下载。
-   * 兜底(spec §9.1 No-Go 备案):手动下载后把 .bin 放进 models/ 目录即被识别。
+   * 解析已存在的模型文件:优先 globalStorage(用户下载/手动导入),
+   * 其次扩展内置 offline-model(打包模型)。都没有则 undefined。
+   */
+  private async resolveExisting(tier: ModelTier): Promise<vscode.Uri | undefined> {
+    const local = this.modelPath(tier);
+    if ((await this.statSize(local)) > 0) return local;
+    if (this.bundledModelsUri) {
+      const bundled = vscode.Uri.joinPath(this.bundledModelsUri, MODELS[tier].fileName);
+      if ((await this.statSize(bundled)) > 0) return bundled;
+    }
+    return undefined;
+  }
+
+  async isDownloaded(tier: ModelTier): Promise<boolean> {
+    return (await this.resolveExisting(tier)) !== undefined;
+  }
+
+  /**
+   * 确保模型可用:已存在(globalStorage 或内置离线模型)直接返回;否则带进度/可取消地下载。
+   * 兜底(spec §9.1 No-Go 备案):手动下载后把 .bin 放进 models/ 目录即被识别;
+   * 或使用 offline VSIX(模型已内置,零下载)。
    */
   async ensureModel(tier: ModelTier): Promise<vscode.Uri> {
     const spec = MODELS[tier];
     const dest = this.modelPath(tier);
-    if (await this.isDownloaded(tier)) return dest;
+    const existing = await this.resolveExisting(tier);
+    if (existing) {
+      this.log(`[model] using existing ${spec.fileName} at ${existing.fsPath}`);
+      return existing;
+    }
 
     return vscode.window.withProgress(
       {
