@@ -87,11 +87,15 @@ export class HelperRecorder implements Recorder {
       this.proc = proc;
 
       proc.on('error', (err: NodeJS.ErrnoException) => {
-        // exe 缺失/无法执行 = 安装损坏,归 init-failed(非 no-device:设备与此无关)
-        const code: RecorderErrorCode = 'init-failed';
+        // Windows Smart App Control / 应用控制策略拦截未签名 exe → spawn 报 UNKNOWN(errno -4094)
+        // 或 EPERM。归 blocked-by-policy 以给出针对性指引;其余(ENOENT 等)= 安装损坏 → init-failed。
+        const blocked = err.code === 'UNKNOWN' || err.code === 'EPERM';
+        const code: RecorderErrorCode = blocked ? 'blocked-by-policy' : 'init-failed';
         const rerr = new RecorderError(
           code,
-          `helper 启动失败:${err.message}(路径 ${this.exePath})`,
+          blocked
+            ? `录音组件被系统应用控制策略(Smart App Control)拦截:${this.exePath}`
+            : `helper 启动失败:${err.message}(路径 ${this.exePath})`,
         );
         this.clearWatchdog();
         settle(() => reject(rerr));

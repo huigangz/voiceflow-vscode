@@ -4,7 +4,8 @@
  */
 import * as vscode from 'vscode';
 import { Session } from './session';
-import { WebviewRecorder } from './audio/webviewRecorder';
+// WebviewRecorder 源码保留但运行时不可达(webview 无麦克风权限,microsoft/vscode#250568);
+// 不再 import,避免打包无用代码。
 import { HelperRecorder } from './audio/helperRecorder';
 import { RecordingController, cleanTmpWavs } from './audio/recordingController';
 import { RecorderError } from './audio/recorder';
@@ -16,6 +17,7 @@ import { CleanupCancelled, EnhanceProvider, runCleanup } from './cleanup/pipelin
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
 import { CliKind, createCliProvider } from './cleanup/cliProvider';
 import { StatusBar } from './ui/statusBar';
+import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
 
 let output: vscode.OutputChannel;
 let session: Session;
@@ -56,12 +58,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('voiceflow.cancelSession', cancelSession),
     vscode.commands.registerCommand('voiceflow.showLogs', () => output.show()),
     vscode.commands.registerCommand('voiceflow.downloadModel', () => modelManager.pickAndDownload()),
-    vscode.commands.registerCommand('voiceflow.openSetupWizard', () => {
-      void vscode.window.showInformationMessage('VoiceFlow: 首启向导在 Phase 3 接入。');
-    }),
-    // Reload Window gate:销毁 webview/音频流 + kill whisper 子进程
+    vscode.commands.registerCommand('voiceflow.openSetupWizard', () =>
+      runSetupWizard({ context, modelManager, log }),
+    ),
+    // Reload Window gate:销毁 helper/音频流 + kill whisper 子进程
     { dispose: () => { recording?.dispose(); whisper?.dispose(); } },
   );
+
+  // 首启邀请(F5):仅 pending 弹一次;不阻塞 activate
+  void maybePromptSetup({ context, modelManager, log });
 }
 
 /** 懒构建/更新 WhisperRunner(配置变更时热更新;模型换档触发 server 重载)。 */
@@ -101,16 +106,13 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
   // F4:插入目标在录音开始时锁定
   insertTarget = captureTarget(focusHint);
   log(`[dictation] target locked: ${insertTarget.kind}`);
-  // P3 已收敛(2026-07-03):webview 无麦克风权限(upstream #250568)→ helper exe 为默认;
-  // webview 路线保留为实验开关,等 upstream 支持后可复测
-  const recorderKind = cfg.get<'helper' | 'webview'>('recorder', 'helper');
-  const recorder =
-    recorderKind === 'webview'
-      ? new WebviewRecorder(extContext.extensionUri, log)
-      : new HelperRecorder(
-          vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-mic.exe').fsPath,
-          log,
-        );
+  // P3 已收敛(2026-07-03):webview 无麦克风权限(upstream microsoft/vscode#250568)→
+  // 硬编码 native helper exe。WebviewRecorder 源码保留但运行时不可达,无配置可路由到它
+  // (旧的 "voiceflow.recorder": "webview" 设置升级后无效,不会再走坏分支)。
+  const recorder = new HelperRecorder(
+    vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-mic.exe').fsPath,
+    log,
+  );
   recording = new RecordingController(
     recorder,
     {
@@ -291,9 +293,14 @@ async function showRecorderError(err: RecorderError): Promise<void> {
       'VoiceFlow: 麦克风权限被拒。请检查 Windows 设置 → 隐私 → 麦克风,允许桌面应用访问;然后重试(会重新弹出授权)。',
     'no-device': 'VoiceFlow: 未找到麦克风设备。请接入麦克风后重试。',
     'device-lost': 'VoiceFlow: 录音设备已断开,本次录音已丢弃。请重新开始。',
+    'blocked-by-policy':
+      'VoiceFlow: 录音组件被 Windows「智能应用控制 / Smart App Control」拦截(它会阻止未签名程序)。' +
+      '这是 preview 的已知限制(录音 helper 尚未代码签名)。请参见 README「已知限制 · Smart App Control」一节的放行说明。',
     'init-failed': 'VoiceFlow: 录音初始化失败。查看日志(VoiceFlow: Show Logs)。',
   };
-  const action = await vscode.window.showErrorMessage(guides[err.code] ?? err.message, '重试', '查看日志');
+  const isPolicy = err.code === 'blocked-by-policy';
+  const buttons = isPolicy ? ['查看日志'] : ['重试', '查看日志'];
+  const action = await vscode.window.showErrorMessage(guides[err.code] ?? err.message, ...buttons);
   if (action === '重试') void vscode.commands.executeCommand('voiceflow.toggleDictation');
   else if (action === '查看日志') output.show();
 }

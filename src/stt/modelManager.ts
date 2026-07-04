@@ -25,35 +25,36 @@ const PRIMARY = 'https://huggingface.co';
 const MIRROR = 'https://hf-mirror.com'; // 国内镜像(F5.2)
 
 export const MODELS: Record<ModelTier, ModelSpec> = {
+  // 标签按 内存/质量/速度 描述(preview 为 CPU 版,不提独显;GPU 加速在后续版本)
   base: {
     tier: 'base',
     fileName: 'ggml-base.bin',
     approxBytes: 148_000_000,
-    label: 'base(~148MB,无独显低配)',
+    label: 'base(~148MB,最快·内存最省·质量一般)',
   },
   small: {
     tier: 'small',
     fileName: 'ggml-small.bin',
     approxBytes: 488_000_000,
-    label: 'small(~488MB,均衡默认)',
+    label: 'small(~488MB,均衡·推荐)',
   },
   'small-q5': {
     tier: 'small-q5',
     fileName: 'ggml-small-q5_1.bin',
     approxBytes: 190_000_000,
-    label: 'small-q5(~190MB,量化省内存)',
+    label: 'small-q5(~190MB,量化·内存省·质量近 small)',
   },
   'large-v3-turbo-q5': {
     tier: 'large-v3-turbo-q5',
     fileName: 'ggml-large-v3-turbo-q5_0.bin',
     approxBytes: 574_000_000,
-    label: 'large-v3-turbo-q5(~574MB,独显推荐)',
+    label: 'large-v3-turbo-q5(~574MB,质量更好·更慢·更占内存)',
   },
   'large-v3-turbo': {
     tier: 'large-v3-turbo',
     fileName: 'ggml-large-v3-turbo.bin',
     approxBytes: 1_624_000_000,
-    label: 'large-v3-turbo(~1.6GB,power-user 手动选项)',
+    label: 'large-v3-turbo(~1.6GB,质量最佳·最慢·内存最高)',
   },
 };
 
@@ -142,6 +143,19 @@ export class ModelManager {
     );
   }
 
+  /**
+   * 下载指定档位并**写回 `voiceflow.model`**(向导与命令共用)。
+   * 成功返回 true;下载成功才写配置 —— 取消/失败不改配置(评审 High:
+   * 否则用户选 base/turbo 后首次听写仍按默认 small 再下一次)。
+   */
+  async downloadAndSetCurrent(tier: ModelTier): Promise<boolean> {
+    await this.ensureModel(tier); // 抛错(cancelled/失败)→ 不写配置,交调用方处理
+    const cfg = vscode.workspace.getConfiguration('voiceflow');
+    await cfg.update('model', tier, vscode.ConfigurationTarget.Global);
+    this.log(`[model] ${tier} 就绪并已设为当前档位`);
+    return true;
+  }
+
   /** 交互式选择档位并下载(voiceflow.downloadModel 命令)。 */
   async pickAndDownload(): Promise<void> {
     const items = await Promise.all(
@@ -152,13 +166,11 @@ export class ModelManager {
       })),
     );
     const picked = await vscode.window.showQuickPick(items, {
-      placeHolder: '选择 whisper 模型档位(P2 默认档位待 S2 实测收敛)',
+      placeHolder: '选择 whisper 模型档位',
     });
     if (!picked) return;
     try {
-      await this.ensureModel(picked.tier);
-      const cfg = vscode.workspace.getConfiguration('voiceflow');
-      await cfg.update('model', picked.tier, vscode.ConfigurationTarget.Global);
+      await this.downloadAndSetCurrent(picked.tier);
       void vscode.window.showInformationMessage(`VoiceFlow: 模型 ${picked.tier} 就绪,已设为当前档位。`);
     } catch (err) {
       if (err instanceof DownloadError && err.code === 'cancelled') {

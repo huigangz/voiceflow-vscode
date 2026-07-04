@@ -2,6 +2,9 @@
 .vscode/**
 .claude/**
 .gitignore
+media/**
+bin.manifest.json
+voiceflow-phase1-plan.md
 src/**
 test/**
 helper/**

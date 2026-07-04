@@ -1,0 +1,30 @@
+{
+  "_comment": "bin/ 内容的权威清单(source of truth)。bin/ 本身 gitignored,由 fetch-whisper.mjs + build:helper 产出;verify-bin.mjs 据此做精确集合 + 分层校验。修改仅限:whisper 版本升级、BLAS/no-BLAS 决策变更。普通构建不得自动改写本文件。",
+  "_decision": "P1-A 用 bench-server.mjs 实测:no-BLAS 与 BLAS 的 small warm 延迟一致(P50 ~3.1s / P95 ~3.3s,均 << 10s/15s 阈值)、输出逐字一致;no-BLAS 省 48MB(VSIX 61MB→~13MB)且不再分发 OpenBLAS(消除 BSD-3-Clause 义务)。故采用 no-BLAS。cold start 略高(8.5s vs 2s)但一次性、不计入 §8.1 延迟指标。",
+  "whisperSource": {
+    "repo": "ggml-org/whisper.cpp",
+    "release": "v1.9.1",
+    "variant": "cpu-noblas",
+    "archive": "whisper-bin-x64.zip",
+    "url": "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-bin-x64.zip",
+    "archiveSha256": "7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539",
+    "archiveSize": 7982101
+  },
+  "files": {
+    "voiceflow-mic.exe": { "source": "build:helper", "verify": "format" },
+    "whisper-cli.exe": { "source": "whisper", "sha256": "58245314fb73b30fbd0cf0542c5c172e23f02b6eb7cad7b51e792439cf5e1755" },
+    "whisper-server.exe": { "source": "whisper", "sha256": "2c1ef08694756eda280e79b8217da63ee2af33c87ac3d5f27d68f9f3f966fd32" },
+    "whisper.dll": { "source": "whisper", "sha256": "b31690c12461517fe9774e61318ab63a69972b948151feed98b913be35f708b6" },
+    "ggml.dll": { "source": "whisper", "sha256": "db753141098018ab482796052a61e727ee0106cbc280f28397f6a111b5e667d7" },
+    "ggml-base.dll": { "source": "whisper", "sha256": "8be6f3e06388b3a9aac75d29bec86363e2e2f5b0cee86ce6438866bcac0bcf86" },
+    "ggml-cpu-alderlake.dll": { "source": "whisper", "sha256": "323408503da53ccc67248b26d711f16d73d2d6239f7703a00a6a18b60ed5b8b8" },
+    "ggml-cpu-cannonlake.dll": { "source": "whisper", "sha256": "0f659d98b823bb871c7845787bba7485facd220099cf58aa773652b9b842ab2e" },
+    "ggml-cpu-cascadelake.dll": { "source": "whisper", "sha256": "8116b0e516134139de29400c536ecf06fe708ce1a078a96d30b562b30d524fbe" },
+    "ggml-cpu-haswell.dll": { "source": "whisper", "sha256": "e5925923a47672392f9e9c8c92e4b9b65ea473948bf4f568a0300a3a42485135" },
+    "ggml-cpu-icelake.dll": { "source": "whisper", "sha256": "b726d528bee0c811c6b2ad8775357379d651cabb487bbf800331697fe73da187" },
+    "ggml-cpu-sandybridge.dll": { "source": "whisper", "sha256": "1c49c64817233b2447ca305b41c66afa4bed31b058bc190a98af2a30cc703542" },
+    "ggml-cpu-skylakex.dll": { "source": "whisper", "sha256": "06082dc62a09a82fbba4aab49b2c049b96db84c5fc561a446a8ddbfb9b20bf86" },
+    "ggml-cpu-sse42.dll": { "source": "whisper", "sha256": "9a8f55ff1dfad231aa6250ac52c330c5bfa5c4c37691c8b591a68b52090ce40c" },
+    "ggml-cpu-x64.dll": { "source": "whisper", "sha256": "45ff644d301b8a1fffc7c5e3864205047360eb197814c7311f366d106bb5b19f" }
+  }
+}

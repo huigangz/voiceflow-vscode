@@ -19,7 +19,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -115,12 +117,6 @@
           "default": 8000,
           "description": "LLM 清理超时(ms),超时后直接插入规则层结果。"
         },
-        "voiceflow.recorder": {
-          "type": "string",
-          "enum": ["helper", "webview"],
-          "default": "helper",
-          "description": "录音实现。helper=native helper exe(默认,P3 结论);webview=实验性(上游 VS Code 暂不支持 webview 麦克风,microsoft/vscode#250568)。"
-        },
         "voiceflow.recording.maxDuration": {
           "type": "number",
           "default": 120,
@@ -187,11 +183,16 @@
   "scripts": {
     "assets": "node scripts/copy-assets.mjs",
     "build:helper": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize /out:bin\\voiceflow-mic.exe helper\\MicCapture.cs",
+    "build:whisper": "node scripts/fetch-whisper.mjs",
     "build:fixtures": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /out:test\\fixtures\\silent-helper.exe test\\fixtures\\SilentHelper.cs",
-    "build": "node scripts/copy-assets.mjs && node esbuild.mjs",
+    "verify-bin": "node scripts/verify-bin.mjs",
+    "bin": "npm run build:helper && npm run build:whisper && npm run verify-bin",
+    "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "bench": "node scripts/bench-server.mjs",
+    "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
     "package": "vsce package --target win32-x64"
   },
   "devDependencies": {

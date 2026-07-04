@@ -10,7 +10,8 @@ export type RecorderErrorCode =
   | 'permission-denied' // 无麦克风权限(F1.4:需给出重新授权指引)
   | 'no-device'         // 无可用输入设备
   | 'device-lost'       // 录音中设备拔出/切换(S1 gate:明确失败回 idle,无半截脏数据)
-  | 'init-failed';      // webview/VAD/音频管线初始化失败
+  | 'blocked-by-policy' // Smart App Control / 应用控制策略拦截未签名 helper(需签名或放行)
+  | 'init-failed';      // 音频管线初始化失败
 
 export class RecorderError extends Error {
   constructor(

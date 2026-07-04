@@ -3,6 +3,7 @@
  * 需要本机有麦克风设备;CI 无设备时跳过(exit 2 视为环境限制)。
  */
 import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import { HelperRecorder } from '../src/audio/helperRecorder';
 import { PcmChunk, RecorderError } from '../src/audio/recorder';
@@ -10,7 +11,18 @@ import { PcmChunk, RecorderError } from '../src/audio/recorder';
 const EXE = 'bin/voiceflow-mic.exe';
 const SILENT = 'test/fixtures/silent-helper.exe';
 
-describe.skipIf(!existsSync(EXE))('HelperRecorder(真实 helper 进程)', () => {
+/**
+ * 该 exe 能否真正被本机启动。用于在 CI(无文件)/ Smart App Control 拦截未签名
+ * 二进制(spawn UNKNOWN)等环境下**优雅跳过**真实进程测试,而非误报失败 ——
+ * SAC 拦截是环境策略,不是录音逻辑缺陷。
+ */
+function canRun(exe: string): boolean {
+  if (!existsSync(exe)) return false;
+  const r = spawnSync(exe, [], { input: '', timeout: 3000 }); // stdin EOF → helper 立即退出
+  return r.error === undefined; // spawn 失败(app-control/UNKNOWN)→ error 有值 → 跳过
+}
+
+describe.skipIf(!canRun(EXE))('HelperRecorder(真实 helper 进程)', () => {
   it('start → 收到 PCM 帧 → stop 干净退出', async () => {
     const rec = new HelperRecorder(EXE, () => {});
     const chunks: PcmChunk[] = [];
@@ -60,7 +72,7 @@ describe.skipIf(!existsSync(EXE))('HelperRecorder(真实 helper 进程)', () => 
 
 // device-lost watchdog:READY 后数据断流 → 判定 device-lost 并 kill 挂起 helper
 // (模拟 winmm 设备拔出后静默挂起;不依赖 helper 自己报错)
-describe.skipIf(!existsSync(SILENT))('HelperRecorder 数据流 watchdog', () => {
+describe.skipIf(!canRun(SILENT))('HelperRecorder 数据流 watchdog', () => {
   it('READY 后持续无数据 → onError(device-lost),且进程被杀', async () => {
     const rec = new HelperRecorder(SILENT, () => {});
     const err = await new Promise<RecorderError>((resolve, reject) => {
