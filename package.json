@@ -1,8 +1,8 @@
 {
   "name": "voiceflow-vscode",
   "displayName": "VoiceFlow",
-  "description": "Wispr Flow 式本地语音听写:按键说话,本地 whisper 转写,清理后插入编辑器或终端。音频永不离开本机。",
-  "version": "0.1.0",
+  "description": "Wispr Flow-style local voice dictation: press a key and speak, transcribe locally with whisper, clean up, and insert into the editor or terminal. Audio never leaves your machine.",
+  "version": "0.1.1",
   "private": true,
   "publisher": "voiceflow-preview",
   "license": "MIT",
@@ -27,23 +27,23 @@
     "commands": [
       {
         "command": "voiceflow.toggleDictation",
-        "title": "VoiceFlow: Toggle Dictation (开始/结束听写)"
+        "title": "VoiceFlow: Toggle Dictation"
       },
       {
         "command": "voiceflow.cancelSession",
-        "title": "VoiceFlow: Cancel Session (取消整个会话)"
+        "title": "VoiceFlow: Cancel Session"
       },
       {
         "command": "voiceflow.downloadModel",
-        "title": "VoiceFlow: Download / Switch Model (下载或切换模型)"
+        "title": "VoiceFlow: Download / Switch Model"
       },
       {
         "command": "voiceflow.openSetupWizard",
-        "title": "VoiceFlow: Setup Wizard (首次启动向导)"
+        "title": "VoiceFlow: Setup Wizard"
       },
       {
         "command": "voiceflow.showLogs",
-        "title": "VoiceFlow: Show Logs (查看日志)"
+        "title": "VoiceFlow: Show Logs"
       }
     ],
     "keybindings": [
@@ -87,7 +87,7 @@
             "auto"
           ],
           "default": "auto",
-          "description": "听写语言。auto=自动检测(默认,§9.2 实测:纯英文/中文/混合全部正确);zh=强制中文;en=强制英文。注意 zh 会把纯英文语音翻译成中文。"
+          "description": "Dictation language. auto = auto-detect (recommended; handles English, Chinese, and mixed correctly); zh = force Chinese; en = force English. Note: zh will translate pure-English speech into Chinese."
         },
         "voiceflow.model": {
           "type": "string",
@@ -99,7 +99,7 @@
             "large-v3-turbo"
           ],
           "default": "small",
-          "description": "whisper 模型档位(默认档位待 P2 实测收敛;当前占位 small)。"
+          "description": "whisper model tier. small is the balanced default (CPU build)."
         },
         "voiceflow.cleanup.provider": {
           "type": "string",
@@ -110,32 +110,32 @@
             "codex-cli"
           ],
           "default": "auto",
-          "description": "清理 provider。auto=规则层+vscode.lm(可用则用);rules-only=文本不出本机;CLI 需显式选择。"
+          "description": "Cleanup provider. auto = rules layer + vscode.lm (used when available); rules-only = text never leaves your machine; CLI providers must be selected explicitly."
         },
         "voiceflow.cleanup.timeout": {
           "type": "number",
           "default": 8000,
-          "description": "LLM 清理超时(ms),超时后直接插入规则层结果。"
+          "description": "LLM cleanup timeout (ms). On timeout, the rules-layer result is inserted directly."
         },
         "voiceflow.recording.maxDuration": {
           "type": "number",
           "default": 120,
-          "description": "最大录音时长(秒),到时自动结束。"
+          "description": "Maximum recording duration (seconds); recording stops automatically when reached."
         },
         "voiceflow.recording.autoStopSilence": {
           "type": "number",
           "default": 3,
-          "description": "VAD 连续静音自动结束(秒),0=关闭。仅在已有语音段后生效。"
+          "description": "Auto-stop after this many seconds of continuous silence (VAD); 0 = disabled. Only applies after speech has been detected."
         },
         "voiceflow.recording.confirmThreshold": {
           "type": "number",
           "default": 30,
-          "description": "录音超过该秒数,插入前进行 lightweight 确认;0=关闭。"
+          "description": "If a recording exceeds this many seconds, show a lightweight confirmation before inserting; 0 = disabled."
         },
         "voiceflow.whisper.binaryDir": {
           "type": "string",
           "default": "",
-          "description": "whisper.cpp 二进制目录(含 whisper-server.exe / whisper-cli.exe)。留空 = 使用扩展内置 bin/ 目录(打包阶段内置)。"
+          "description": "whisper.cpp binary directory (containing whisper-server.exe / whisper-cli.exe). Leave empty to use the extension's bundled bin/ directory."
         },
         "voiceflow.whisper.mode": {
           "type": "string",
@@ -145,37 +145,37 @@
             "cli"
           ],
           "default": "auto",
-          "description": "whisper 运行形态(P1 待 S2 实测收敛)。auto=有 server 二进制则 server,否则 CLI。"
+          "description": "whisper run mode. auto = use server if the server binary exists, otherwise CLI."
         },
         "voiceflow.whisper.idleUnload": {
           "type": "number",
           "default": 10,
-          "description": "模型空闲自动卸载(分钟),0=常驻。"
+          "description": "Unload the model after this many minutes idle; 0 = keep resident."
         },
         "voiceflow.rules.convertToSimplified": {
           "type": "boolean",
           "default": true,
-          "description": "规则层:繁体转简体。"
+          "description": "Rules layer: convert Traditional Chinese to Simplified."
         },
         "voiceflow.rules.spacingCJKLatin": {
           "type": "boolean",
           "default": true,
-          "description": "规则层:中英文之间加空格。"
+          "description": "Rules layer: add spaces between CJK and Latin characters."
         },
         "voiceflow.rules.normalizePunctuation": {
           "type": "boolean",
           "default": true,
-          "description": "规则层:常见全角/半角标点归一。"
+          "description": "Rules layer: normalize common full-width/half-width punctuation."
         },
         "voiceflow.rules.collapseSpaces": {
           "type": "boolean",
           "default": true,
-          "description": "规则层:去除重复空格。"
+          "description": "Rules layer: collapse repeated spaces."
         },
         "voiceflow.rules.stripHallucinations": {
           "type": "boolean",
           "default": true,
-          "description": "规则层:去除 whisper 常见尾部幻觉(如“谢谢观看”)。"
+          "description": "Rules layer: strip whisper's common trailing hallucinations (e.g. \"谢谢观看\")."
         }
       }
     }

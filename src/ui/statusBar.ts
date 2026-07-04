@@ -23,33 +23,33 @@ export class StatusBar implements vscode.Disposable {
     switch (state) {
       case 'idle':
         this.item.text = '$(mic) VoiceFlow';
-        this.item.tooltip = 'Ctrl+Alt+L 开始听写';
+        this.item.tooltip = 'Ctrl+Alt+L to start dictation';
         this.item.command = 'voiceflow.toggleDictation';
         this.item.backgroundColor = undefined;
         break;
       case 'recording':
         // 麦克风尚未就绪(helper spawn ~200-300ms):先示"启动中",
         // recordingLive() 后才亮红点计时 —— 否则用户见红即说,开头吞字(gate 实测)
-        this.item.text = '$(loading~spin) VoiceFlow: 麦克风启动中…';
+        this.item.text = '$(loading~spin) VoiceFlow: Starting mic…';
         this.item.command = 'voiceflow.cancelSession';
-        this.item.tooltip = 'Esc 取消';
+        this.item.tooltip = 'Esc to cancel';
         this.item.backgroundColor = undefined;
         break;
       case 'transcribing':
         this.item.text = this.modelLoading
-          ? '$(loading~spin) VoiceFlow: 模型加载中…'
-          : '$(loading~spin) VoiceFlow: 转写中…';
-        this.item.tooltip = 'Esc 取消';
+          ? '$(loading~spin) VoiceFlow: Loading model…'
+          : '$(loading~spin) VoiceFlow: Transcribing…';
+        this.item.tooltip = 'Esc to cancel';
         this.item.command = 'voiceflow.cancelSession';
         this.item.backgroundColor = undefined;
         break;
       case 'cleaning':
-        this.item.text = '$(loading~spin) VoiceFlow: 清理中…';
-        this.item.tooltip = 'Esc 取消';
+        this.item.text = '$(loading~spin) VoiceFlow: Cleaning up…';
+        this.item.tooltip = 'Esc to cancel';
         this.item.command = 'voiceflow.cancelSession';
         break;
       case 'inserting':
-        this.item.text = '$(loading~spin) VoiceFlow: 插入中…';
+        this.item.text = '$(loading~spin) VoiceFlow: Inserting…';
         this.item.command = undefined;
         break;
     }
@@ -59,7 +59,7 @@ export class StatusBar implements vscode.Disposable {
   recordingLive(): void {
     this.recordingSince = Date.now();
     this.item.command = 'voiceflow.toggleDictation';
-    this.item.tooltip = '再按 Ctrl+Alt+L 结束,Esc 取消';
+    this.item.tooltip = 'Press Ctrl+Alt+L to stop, Esc to cancel';
     this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
     this.renderRecording();
     this.timer = setInterval(() => this.renderRecording(), 1000);
@@ -69,7 +69,7 @@ export class StatusBar implements vscode.Disposable {
   setModelLoading(loading: boolean): void {
     this.modelLoading = loading;
     if (loading) {
-      this.item.text = '$(loading~spin) VoiceFlow: 模型加载中…';
+      this.item.text = '$(loading~spin) VoiceFlow: Loading model…';
     }
   }
 
@@ -77,7 +77,7 @@ export class StatusBar implements vscode.Disposable {
   showError(brief: string): void {
     this.stopTimer();
     this.item.text = '$(error) VoiceFlow';
-    this.item.tooltip = `${brief} — 点击查看日志`;
+    this.item.tooltip = `${brief} — click to view logs`;
     this.item.command = 'voiceflow.showLogs';
     this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
   }

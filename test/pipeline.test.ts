@@ -109,10 +109,10 @@ describe('清理管线 (F3.3/F3.4)', () => {
     expect(r.degraded).toBe('rejected');
   });
 
-  it('模型回显定界符 → 剥除后正常使用', async () => {
+  it('strips echoed delimiter, then uses the result', async () => {
     const r = await runCleanup('你好world', {
       ...base,
-      enhancer: enhancer(async () => '<转写>\n你好 world。\n</转写>'),
+      enhancer: enhancer(async () => '<transcript>\n你好 world。\n</transcript>'),
     });
     expect(r.text).toBe('你好 world。');
     expect(r.usedProvider).toBe('fake-llm');

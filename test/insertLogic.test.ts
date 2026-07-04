@@ -50,12 +50,12 @@ describe('outcomeMessage', () => {
     }
   });
 
-  it('剪贴板类 outcome 文案包含"剪贴板"提示', () => {
-    expect(outcomeMessage('clipboard-editor-closed')).toContain('剪贴板');
-    expect(outcomeMessage('clipboard-no-target')).toContain('剪贴板');
+  it('clipboard outcomes mention "clipboard"', () => {
+    expect(outcomeMessage('clipboard-editor-closed')).toContain('clipboard');
+    expect(outcomeMessage('clipboard-no-target')).toContain('clipboard');
   });
 
-  it('终端写入文案强调未执行(不代执行)', () => {
-    expect(outcomeMessage('inserted-terminal')).toContain('未执行');
+  it('terminal outcome stresses "not executed"', () => {
+    expect(outcomeMessage('inserted-terminal')).toContain('not executed');
   });
 });

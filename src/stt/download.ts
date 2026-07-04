@@ -41,7 +41,7 @@ export async function checkDiskSpace(destPath: string, requiredBytes: number): P
   if (available < requiredBytes * 1.1) {
     throw new DownloadError(
       'disk-full',
-      `磁盘空间不足:需要约 ${(requiredBytes / 1e9).toFixed(1)}GB,可用 ${(available / 1e9).toFixed(1)}GB`,
+      `Not enough disk space: need about ${(requiredBytes / 1e9).toFixed(1)}GB, ${(available / 1e9).toFixed(1)}GB available`,
     );
   }
 }
@@ -112,7 +112,7 @@ export async function downloadWithResume(opts: DownloadOptions): Promise<void> {
   let lastErr: unknown;
   for (const url of opts.urls) {
     for (let attempt = 0; attempt <= retries; attempt++) {
-      if (opts.signal?.aborted) throw new DownloadError('cancelled', '用户取消下载');
+      if (opts.signal?.aborted) throw new DownloadError('cancelled', 'download cancelled by user');
       try {
         await downloadOne(url, partPath, opts);
         if (opts.expectedSha256 !== undefined) {
@@ -121,7 +121,7 @@ export async function downloadWithResume(opts: DownloadOptions): Promise<void> {
             await rm(partPath, { force: true }); // 损坏文件不保留,重下
             throw new DownloadError(
               'sha-mismatch',
-              `SHA-256 校验失败:期望 ${opts.expectedSha256},实际 ${actual}(来源 ${url})`,
+              `SHA-256 verification failed: expected ${opts.expectedSha256}, got ${actual} (source ${url})`,
             );
           }
         }
@@ -130,7 +130,7 @@ export async function downloadWithResume(opts: DownloadOptions): Promise<void> {
       } catch (err) {
         if (opts.signal?.aborted || (err instanceof Error && err.name === 'AbortError')) {
           // 取消:保留 .part 供下次续传
-          throw new DownloadError('cancelled', '用户取消下载(已下载部分保留,可续传)');
+          throw new DownloadError('cancelled', 'download cancelled by user (partial download kept; resumable)');
         }
         lastErr = err;
         // sha-mismatch 换下一个源(同源重试大概率同样损坏)
@@ -138,7 +138,7 @@ export async function downloadWithResume(opts: DownloadOptions): Promise<void> {
       }
     }
   }
-  throw new DownloadError('all-sources-failed', `全部下载源失败:${String(lastErr)}`);
+  throw new DownloadError('all-sources-failed', `all download sources failed: ${String(lastErr)}`);
 }
 
 /**

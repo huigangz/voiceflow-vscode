@@ -38,16 +38,16 @@ export type InsertOutcome =
 export function outcomeMessage(outcome: InsertOutcome): string {
   switch (outcome) {
     case 'inserted-editor':
-      return '$(check) VoiceFlow: 已插入';
+      return '$(check) VoiceFlow: Inserted';
     case 'inserted-terminal':
-      return '$(terminal) VoiceFlow: 已写入终端(未执行)';
+      return '$(terminal) VoiceFlow: Sent to terminal (not executed)';
     case 'clipboard-editor-closed':
-      return '$(clippy) VoiceFlow: 原编辑器已关闭,已复制到剪贴板';
+      return '$(clippy) VoiceFlow: Original editor closed — copied to clipboard';
     case 'clipboard-range-invalid':
-      return '$(clippy) VoiceFlow: 原位置已失效,已复制到剪贴板';
+      return '$(clippy) VoiceFlow: Original position no longer valid — copied to clipboard';
     case 'clipboard-terminal-dead':
-      return '$(clippy) VoiceFlow: 终端已退出,已复制到剪贴板';
+      return '$(clippy) VoiceFlow: Terminal exited — copied to clipboard';
     case 'clipboard-no-target':
-      return '$(clippy) VoiceFlow: 无插入目标,已复制到剪贴板';
+      return '$(clippy) VoiceFlow: No insertion target — copied to clipboard';
   }
 }

@@ -25,36 +25,36 @@ const PRIMARY = 'https://huggingface.co';
 const MIRROR = 'https://hf-mirror.com'; // 国内镜像(F5.2)
 
 export const MODELS: Record<ModelTier, ModelSpec> = {
-  // 标签按 内存/质量/速度 描述(preview 为 CPU 版,不提独显;GPU 加速在后续版本)
+  // Labels describe memory / quality / speed (preview is a CPU build; no GPU wording — GPU acceleration is a later release)
   base: {
     tier: 'base',
     fileName: 'ggml-base.bin',
     approxBytes: 148_000_000,
-    label: 'base(~148MB,最快·内存最省·质量一般)',
+    label: 'base (~148MB, fastest, lowest memory, basic quality)',
   },
   small: {
     tier: 'small',
     fileName: 'ggml-small.bin',
     approxBytes: 488_000_000,
-    label: 'small(~488MB,均衡·推荐)',
+    label: 'small (~488MB, balanced, recommended)',
   },
   'small-q5': {
     tier: 'small-q5',
     fileName: 'ggml-small-q5_1.bin',
     approxBytes: 190_000_000,
-    label: 'small-q5(~190MB,量化·内存省·质量近 small)',
+    label: 'small-q5 (~190MB, quantized, low memory, near-small quality)',
   },
   'large-v3-turbo-q5': {
     tier: 'large-v3-turbo-q5',
     fileName: 'ggml-large-v3-turbo-q5_0.bin',
     approxBytes: 574_000_000,
-    label: 'large-v3-turbo-q5(~574MB,质量更好·更慢·更占内存)',
+    label: 'large-v3-turbo-q5 (~574MB, better quality, slower, more memory)',
   },
   'large-v3-turbo': {
     tier: 'large-v3-turbo',
     fileName: 'ggml-large-v3-turbo.bin',
     approxBytes: 1_624_000_000,
-    label: 'large-v3-turbo(~1.6GB,质量最佳·最慢·内存最高)',
+    label: 'large-v3-turbo (~1.6GB, best quality, slowest, highest memory)',
   },
 };
 
@@ -93,7 +93,7 @@ export class ModelManager {
     return vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: `VoiceFlow: 下载模型 ${spec.fileName}`,
+        title: `VoiceFlow: Downloading model ${spec.fileName}`,
         cancellable: true,
       },
       async (progress, token) => {
@@ -110,7 +110,7 @@ export class ModelManager {
           controller.signal,
         );
         if (expectedSha256 === undefined) {
-          this.log('[model] WARN: 无法获取期望 SHA-256(HF API 不可达),本次跳过校验');
+          this.log('[model] WARN: could not fetch expected SHA-256 (HF API unreachable); skipping verification this time');
         }
 
         let lastPct = 0;
@@ -161,22 +161,22 @@ export class ModelManager {
     const items = await Promise.all(
       (Object.values(MODELS) as ModelSpec[]).map(async (m) => ({
         label: m.label,
-        description: (await this.isDownloaded(m.tier)) ? '✓ 已下载' : '',
+        description: (await this.isDownloaded(m.tier)) ? '✓ Downloaded' : '',
         tier: m.tier,
       })),
     );
     const picked = await vscode.window.showQuickPick(items, {
-      placeHolder: '选择 whisper 模型档位',
+      placeHolder: 'Select a whisper model tier',
     });
     if (!picked) return;
     try {
       await this.downloadAndSetCurrent(picked.tier);
-      void vscode.window.showInformationMessage(`VoiceFlow: 模型 ${picked.tier} 就绪,已设为当前档位。`);
+      void vscode.window.showInformationMessage(`VoiceFlow: model ${picked.tier} is ready and set as current.`);
     } catch (err) {
       if (err instanceof DownloadError && err.code === 'cancelled') {
-        void vscode.window.showInformationMessage('VoiceFlow: 下载已取消(已下载部分保留,可续传)。');
+        void vscode.window.showInformationMessage('VoiceFlow: download cancelled (partial download kept; resumable).');
       } else {
-        void vscode.window.showErrorMessage(`VoiceFlow: 模型下载失败 — ${String(err)}`);
+        void vscode.window.showErrorMessage(`VoiceFlow: model download failed — ${String(err)}`);
       }
     }
   }

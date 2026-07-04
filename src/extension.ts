@@ -129,7 +129,7 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
   recording.onError = (err: RecorderError) => {
     log(`[recording] failed: ${err.code} — ${err.message}`);
     session.dispatch('error');
-    statusBar.showError(`录音失败:${err.code}`);
+    statusBar.showError(`Recording failed: ${err.code}`);
     recording?.dispose();
     recording = undefined;
     void showRecorderError(err);
@@ -139,14 +139,14 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
   try {
     await recording.start();
     statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
-    log('[dictation] recording…(再按 Ctrl+Alt+L 结束,Esc 取消)');
+    log('[dictation] recording… (press Ctrl+Alt+L to stop, Esc to cancel)');
   } catch (err) {
     session.dispatch('error');
-    statusBar.showError('录音启动失败');
+    statusBar.showError('Failed to start recording');
     recording.dispose();
     recording = undefined;
     if (err instanceof RecorderError) void showRecorderError(err);
-    else void vscode.window.showErrorMessage(`VoiceFlow: 录音启动失败 — ${String(err)}`);
+    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
   }
 }
 
@@ -209,16 +209,16 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       .get<number>('recording.confirmThreshold', 30);
     if (confirmThreshold > 0 && result.durationMs > confirmThreshold * 1000) {
       const preview = cleaned.length > 80 ? `${cleaned.slice(0, 80)}…` : cleaned;
-      const choice = await vscode.window.showQuickPick(['插入', '复制到剪贴板', '丢弃'], {
-        placeHolder: `长录音确认(${(result.durationMs / 1000).toFixed(0)}s):${preview}`,
+      const choice = await vscode.window.showQuickPick(['Insert', 'Copy to clipboard', 'Discard'], {
+        placeHolder: `Long recording (${(result.durationMs / 1000).toFixed(0)}s) — confirm: ${preview}`,
       });
-      if (choice === undefined || choice === '丢弃') {
+      if (choice === undefined || choice === 'Discard') {
         session.dispatch('cancel');
         return;
       }
-      if (choice === '复制到剪贴板') {
+      if (choice === 'Copy to clipboard') {
         await vscode.env.clipboard.writeText(cleaned);
-        vscode.window.setStatusBarMessage('$(clippy) VoiceFlow: 已复制', 5000);
+        vscode.window.setStatusBarMessage('$(clippy) VoiceFlow: Copied to clipboard', 5000);
         session.dispatch('cancel');
         return;
       }
@@ -235,7 +235,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       return; // 会话已由 cancelSession 置回 idle
     }
     session.dispatch('error');
-    statusBar.showError('听写失败');
+    statusBar.showError('Dictation failed');
     log(`[dictation] failed: ${String(err)}`);
     void vscode.window.showErrorMessage(`VoiceFlow: ${String(err)}`);
   } finally {
@@ -287,22 +287,22 @@ function cancelSession(): void {
 }
 
 async function showRecorderError(err: RecorderError): Promise<void> {
-  // F1.4:明确错误提示 + 解决指引;权限被拒后可重新引导授权
+  // F1.4: clear error message + guidance; can re-prompt for permission after a denial
   const guides: Record<string, string> = {
     'permission-denied':
-      'VoiceFlow: 麦克风权限被拒。请检查 Windows 设置 → 隐私 → 麦克风,允许桌面应用访问;然后重试(会重新弹出授权)。',
-    'no-device': 'VoiceFlow: 未找到麦克风设备。请接入麦克风后重试。',
-    'device-lost': 'VoiceFlow: 录音设备已断开,本次录音已丢弃。请重新开始。',
+      'VoiceFlow: microphone permission denied. Check Windows Settings → Privacy → Microphone and allow desktop apps to access it, then retry (the permission prompt will reappear).',
+    'no-device': 'VoiceFlow: no microphone found. Connect a microphone and retry.',
+    'device-lost': 'VoiceFlow: the recording device was disconnected; this recording was discarded. Please start again.',
     'blocked-by-policy':
-      'VoiceFlow: 录音组件被 Windows「智能应用控制 / Smart App Control」拦截(它会阻止未签名程序)。' +
-      '这是 preview 的已知限制(录音 helper 尚未代码签名)。请参见 README「已知限制 · Smart App Control」一节的放行说明。',
-    'init-failed': 'VoiceFlow: 录音初始化失败。查看日志(VoiceFlow: Show Logs)。',
+      'VoiceFlow: the recording component was blocked by Windows Smart App Control (which blocks unsigned programs). ' +
+      'This is a known preview limitation (the recording helper is not yet code-signed). It is usually temporary — wait a moment and try again. See the "Known limitations · Smart App Control" section in the README.',
+    'init-failed': 'VoiceFlow: failed to initialize recording. See the logs (VoiceFlow: Show Logs).',
   };
   const isPolicy = err.code === 'blocked-by-policy';
-  const buttons = isPolicy ? ['查看日志'] : ['重试', '查看日志'];
+  const buttons = isPolicy ? ['View Logs'] : ['Retry', 'View Logs'];
   const action = await vscode.window.showErrorMessage(guides[err.code] ?? err.message, ...buttons);
-  if (action === '重试') void vscode.commands.executeCommand('voiceflow.toggleDictation');
-  else if (action === '查看日志') output.show();
+  if (action === 'Retry') void vscode.commands.executeCommand('voiceflow.toggleDictation');
+  else if (action === 'View Logs') output.show();
 }
 
 export function deactivate(): void {

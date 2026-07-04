@@ -16,10 +16,11 @@ import { createVscodeLmProvider } from '../cleanup/vscodeLmProvider';
 export type SetupState = 'pending' | 'dismissed' | 'completed';
 const STATE_KEY = 'voiceflow.setupState';
 
-/** spec §1 隐私声明原文。 */
+/** Privacy statement (spec §1). */
 const PRIVACY =
-  '隐私声明:音频永不离开本机。启用 AI 清理时,转写文本会发送给你选择的模型服务' +
-  '(Copilot / Claude / Codex);rules-only 模式下文本也不出本机。VoiceFlow 零遥测。';
+  'Privacy: your audio never leaves your machine. When AI cleanup is enabled, the transcribed ' +
+  'text is sent to the model service you choose (Copilot / Claude / Codex); in rules-only mode ' +
+  'the text also stays on your machine. VoiceFlow has zero telemetry.';
 
 /**
  * 内存 → 推荐档位(纯函数,可单元测试)。
@@ -47,62 +48,63 @@ export interface WizardDeps {
 export async function runSetupWizard(deps: WizardDeps): Promise<void> {
   const { context, modelManager, log } = deps;
 
-  // ① 隐私声明(F5.4)
-  const ack = await vscode.window.showInformationMessage(PRIVACY, { modal: true }, '我知道了');
-  if (ack !== '我知道了') return;
+  // ① Privacy statement (F5.4)
+  const ack = await vscode.window.showInformationMessage(PRIVACY, { modal: true }, 'Got it');
+  if (ack !== 'Got it') return;
 
-  // ② 档位推荐(F5.1,展示不自动切)
+  // ② Tier recommendation (F5.1, show — don't auto-switch)
   const totalGb = Math.round(os.totalmem() / 1e9);
   const recommended = recommendTier(os.totalmem());
   const items = (Object.values(MODELS) as ModelSpec[]).map((m) => ({
     label: (m.tier === recommended ? '$(star-full) ' : '') + m.label,
-    description: m.tier === recommended ? '推荐' : '',
+    description: m.tier === recommended ? 'Recommended' : '',
     tier: m.tier,
   }));
   const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: `选择语音模型档位(本机内存 ${totalGb}GB;当前为 CPU 版,GPU 加速在后续版本)`,
+    placeHolder: `Select a voice model tier (${totalGb}GB RAM; this is a CPU build, GPU acceleration is a later release)`,
     ignoreFocusOut: true,
   });
-  if (!picked) return; // 取消 → 不改状态
+  if (!picked) return; // cancelled → don't change state
 
-  // ③ 下载 + 写回配置(F5.2);仅成功才继续到 completed
+  // ③ Download + write back config (F5.2); only reach completed on success
   try {
     await modelManager.downloadAndSetCurrent(picked.tier);
   } catch (err) {
     if (err instanceof DownloadError && err.code === 'cancelled') {
       void vscode.window.showInformationMessage(
-        'VoiceFlow: 下载已取消(已下载部分保留,可续传)。稍后可再次运行 “VoiceFlow: Setup Wizard”。',
+        'VoiceFlow: download cancelled (partial download kept; resumable). You can run "VoiceFlow: Setup Wizard" again later.',
       );
     } else {
-      void vscode.window.showErrorMessage(`VoiceFlow: 模型下载失败 — ${String(err)}`);
+      void vscode.window.showErrorMessage(`VoiceFlow: model download failed — ${String(err)}`);
     }
-    return; // 不置 completed、不改配置
+    return; // don't mark completed, don't change config
   }
 
-  // ④ vscode.lm 探测展示(F5.3)
+  // ④ vscode.lm availability (F5.3)
   const lm = await createVscodeLmProvider(log);
   const lmMsg = lm
-    ? `AI 清理可用(${lm.name}),将自动增强`
-    : '未检测到可用 AI 模型 → 使用本地规则清理(文本不出本机);如需 AI 清理可安装 Copilot,或在设置选 claude-cli / codex-cli';
+    ? `AI cleanup available (${lm.name}) — will enhance automatically`
+    : 'No AI model detected → using local rules cleanup (text stays on your machine). For AI cleanup, install Copilot or select claude-cli / codex-cli in settings';
 
-  // ⑤ 完成 + 引导首次听写(F5.4)
+  // ⑤ Done + guide first dictation (F5.4)
   await setState(context, 'completed');
   void vscode.window.showInformationMessage(
-    `VoiceFlow 就绪!${lmMsg}。现在聚焦编辑器,按 Ctrl+Alt+L 试录一句中文。`,
+    `VoiceFlow is ready! ${lmMsg}. Now focus an editor and press Ctrl+Alt+L to try dictating a sentence.`,
   );
 }
 
 /**
- * activate 时调用:仅 pending 弹一次首启邀请;弹过即置 dismissed(**首启邀请只弹一次**,
- * 不再骚扰);选“运行向导”则进 runSetupWizard(成功 → completed)。命令始终可手动重开。
+ * Called on activate: prompt once only while pending, then mark dismissed (**the first-run
+ * invite shows only once**, no repeated nagging); choosing "Run wizard" enters runSetupWizard
+ * (success → completed). The command can always reopen it manually.
  */
 export async function maybePromptSetup(deps: WizardDeps): Promise<void> {
   if (getSetupState(deps.context) !== 'pending') return;
   const choice = await vscode.window.showInformationMessage(
-    'VoiceFlow:运行首次设置向导?将下载本地语音模型并完成配置(约几分钟)。',
-    '运行向导',
-    '稍后',
+    'VoiceFlow: run the first-time setup wizard? It downloads the local voice model and finishes configuration (a few minutes).',
+    'Run wizard',
+    'Later',
   );
-  await setState(deps.context, 'dismissed'); // 无论选择,首启邀请只弹一次
-  if (choice === '运行向导') await runSetupWizard(deps);
+  await setState(deps.context, 'dismissed'); // whichever choice, the first-run invite shows only once
+  if (choice === 'Run wizard') await runSetupWizard(deps);
 }
