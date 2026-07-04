@@ -75,7 +75,7 @@ async function getWhisper(): Promise<WhisperRunner> {
   const runnerCfg = {
     binaryDir,
     modelPath: modelUri.fsPath,
-    language: cfg.get<'zh' | 'en' | 'auto'>('language', 'zh'),
+    language: cfg.get<'zh' | 'en' | 'auto'>('language', 'auto'),
     initialPrompt: DEFAULT_INITIAL_PROMPT,
     mode: cfg.get<WhisperMode | 'auto'>('whisper.mode', 'auto'),
     idleUnloadMinutes: cfg.get<number>('whisper.idleUnload', 10),
@@ -136,6 +136,7 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
   session.dispatch('start');
   try {
     await recording.start();
+    statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
     log('[dictation] recording…(再按 Ctrl+Alt+L 结束,Esc 取消)');
   } catch (err) {
     session.dispatch('error');

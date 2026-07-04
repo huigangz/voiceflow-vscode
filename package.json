@@ -84,8 +84,8 @@
             "en",
             "auto"
           ],
-          "default": "zh",
-          "description": "听写语言。zh=中文(含中英混合),en=英文,auto=自动检测。"
+          "default": "auto",
+          "description": "听写语言。auto=自动检测(默认,§9.2 实测:纯英文/中文/混合全部正确);zh=强制中文;en=强制英文。注意 zh 会把纯英文语音翻译成中文。"
         },
         "voiceflow.model": {
           "type": "string",

@@ -28,12 +28,12 @@ export class StatusBar implements vscode.Disposable {
         this.item.backgroundColor = undefined;
         break;
       case 'recording':
-        this.recordingSince = Date.now();
-        this.item.command = 'voiceflow.toggleDictation';
-        this.item.tooltip = '再按 Ctrl+Alt+L 结束,Esc 取消';
-        this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
-        this.renderRecording();
-        this.timer = setInterval(() => this.renderRecording(), 1000);
+        // 麦克风尚未就绪(helper spawn ~200-300ms):先示"启动中",
+        // recordingLive() 后才亮红点计时 —— 否则用户见红即说,开头吞字(gate 实测)
+        this.item.text = '$(loading~spin) VoiceFlow: 麦克风启动中…';
+        this.item.command = 'voiceflow.cancelSession';
+        this.item.tooltip = 'Esc 取消';
+        this.item.backgroundColor = undefined;
         break;
       case 'transcribing':
         this.item.text = this.modelLoading
@@ -53,6 +53,16 @@ export class StatusBar implements vscode.Disposable {
         this.item.command = undefined;
         break;
     }
+  }
+
+  /** 麦克风就绪,开始亮红点计时(录音管线 start() resolve 后调用)。 */
+  recordingLive(): void {
+    this.recordingSince = Date.now();
+    this.item.command = 'voiceflow.toggleDictation';
+    this.item.tooltip = '再按 Ctrl+Alt+L 结束,Esc 取消';
+    this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+    this.renderRecording();
+    this.timer = setInterval(() => this.renderRecording(), 1000);
   }
 
   /** F2.1:模型加载单独呈现(cold start 不计入听写延迟)。 */
