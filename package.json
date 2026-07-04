@@ -38,6 +38,10 @@
         "title": "VoiceFlow: Download / Switch Model"
       },
       {
+        "command": "voiceflow.importModel",
+        "title": "VoiceFlow: Import Model File…"
+      },
+      {
         "command": "voiceflow.openSetupWizard",
         "title": "VoiceFlow: Setup Wizard"
       },
@@ -100,6 +104,11 @@
           ],
           "default": "small",
           "description": "whisper model tier. small is the balanced default (CPU build)."
+        },
+        "voiceflow.model.sourceUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Custom model source for restricted networks. An https base URL (e.g. https://intranet/whisper-models) is used before HuggingFace — the model file name is appended. A local/UNC folder (e.g. \\\\server\\share\\models or D:\\models) is copied from directly. Leave empty to use HuggingFace + hf-mirror."
         },
         "voiceflow.cleanup.provider": {
           "type": "string",

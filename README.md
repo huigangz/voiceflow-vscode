@@ -15,6 +15,18 @@ Wispr Flow-style voice dictation: press `Ctrl+Alt+L` and speak — your speech i
 
 > **The preview is a CPU build**: it uses a whisper.cpp CPU build; the `small` tier is about 3s end-to-end on a typical dev machine (including AI cleanup). GPU acceleration (Vulkan) is a later release.
 
+## Restricted / offline networks
+
+If your environment blocks downloading model files (e.g. from HuggingFace), you have three options — the whisper binaries are already bundled, so the model is the only thing that would otherwise be fetched:
+
+1. **Offline VSIX** — download the `…-offline.vsix` from the release. The `small` model is bundled inside; installing it needs **zero downloads**.
+2. **Import a model file** — obtain a `ggml-*.bin` through an approved channel, then run **`VoiceFlow: Import Model File…`** and select it. It's copied into place and set as current (the file can even be renamed — you'll be asked which tier it is).
+3. **Internal mirror / share** — set `voiceflow.model.sourceUrl` to your organization's source, and the extension fetches from there instead of HuggingFace:
+   - an **https base URL** (e.g. `https://intranet/whisper-models`) — the model filename is appended;
+   - or a **local/UNC folder** (e.g. `\\server\share\models` or `D:\models`) — copied from directly.
+
+You can also manually place a `ggml-*.bin` in `%APPDATA%\Code\User\globalStorage\voiceflow-preview.voiceflow-vscode\models\` — it's detected automatically with no download.
+
 ## How it behaves
 
 - The insertion target is locked **when recording starts**; if by the end the original editor was closed / the cursor position became invalid / the terminal exited, the text is copied to the clipboard with a notice.

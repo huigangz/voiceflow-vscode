@@ -63,6 +63,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('voiceflow.cancelSession', cancelSession),
     vscode.commands.registerCommand('voiceflow.showLogs', () => output.show()),
     vscode.commands.registerCommand('voiceflow.downloadModel', () => modelManager.pickAndDownload()),
+    vscode.commands.registerCommand('voiceflow.importModel', () => modelManager.pickAndImport()),
     vscode.commands.registerCommand('voiceflow.openSetupWizard', () =>
       runSetupWizard({ context, modelManager, log }),
     ),

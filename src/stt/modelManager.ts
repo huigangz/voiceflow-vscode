@@ -2,6 +2,10 @@
  * 模型档位管理 + 下载编排(F5.2,S2 mini-spike 的 vscode 胶水层)。
  * 下载核心逻辑在 ./download.ts(纯 Node,可测试)。
  */
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+import { mkdir, rename, stat } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import * as vscode from 'vscode';
 import {
   DownloadError,
@@ -118,6 +122,23 @@ export class ModelManager {
       return existing;
     }
 
+    // C:自定义模型源(内部镜像 / 本地共享)。http(s) → 加入下载源;本地/UNC 路径 → 直接复制。
+    const sourceUrl = vscode.workspace
+      .getConfiguration('voiceflow')
+      .get<string>('model.sourceUrl', '')
+      .trim();
+    const httpSource = /^https?:\/\//i.test(sourceUrl) ? sourceUrl.replace(/\/+$/, '') : undefined;
+    const localDir = sourceUrl && !httpSource ? sourceUrl.replace(/^file:\/\//i, '') : undefined;
+    if (localDir) {
+      const src = join(localDir, spec.fileName);
+      if (existsSync(src)) {
+        await this.copyModelWithProgress(src, dest, spec);
+        this.log(`[model] copied ${spec.fileName} from custom local source ${localDir}`);
+        return dest;
+      }
+      this.log(`[model] custom local source set but ${src} not found; falling back to download`);
+    }
+
     return vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -144,7 +165,9 @@ export class ModelManager {
         let lastPct = 0;
         const t0 = Date.now();
         await downloadWithResume({
+          // C:自定义 http 镜像优先,其次 HF + 国内镜像
           urls: [
+            ...(httpSource ? [`${httpSource}/${spec.fileName}`] : []),
             `${PRIMARY}/${HF_REPO}/resolve/main/${spec.fileName}`,
             `${MIRROR}/${HF_REPO}/resolve/main/${spec.fileName}`,
           ],
@@ -169,6 +192,92 @@ export class ModelManager {
         return dest;
       },
     );
+  }
+
+  /** 带进度地把一个模型文件复制到 globalStorage(用于 C 本地源 / D 导入)。原子:.part → rename。 */
+  private async copyModelWithProgress(srcFsPath: string, destUri: vscode.Uri, spec: ModelSpec): Promise<void> {
+    await checkDiskSpace(destUri.fsPath, spec.approxBytes);
+    await mkdir(dirname(destUri.fsPath), { recursive: true });
+    const part = `${destUri.fsPath}.part`;
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `VoiceFlow: Importing model ${spec.fileName}`,
+        cancellable: false,
+      },
+      async (progress) => {
+        const total = (await stat(srcFsPath)).size;
+        let copied = 0;
+        let lastPct = 0;
+        const counter = async function* (source: AsyncIterable<Buffer>) {
+          for await (const chunk of source) {
+            copied += chunk.length;
+            const pct = Math.floor((copied / total) * 100);
+            if (pct > lastPct) {
+              progress.report({
+                increment: pct - lastPct,
+                message: `${(copied / 1e6).toFixed(0)}MB / ${(total / 1e6).toFixed(0)}MB`,
+              });
+              lastPct = pct;
+            }
+            yield chunk;
+          }
+        };
+        await pipeline(createReadStream(srcFsPath), counter, createWriteStream(part));
+      },
+    );
+    await rename(part, destUri.fsPath);
+  }
+
+  /** 档位 ← 文件名(D:导入时从选中文件名推断档位)。 */
+  tierFromFileName(fileName: string): ModelTier | undefined {
+    const base = fileName.split(/[\\/]/).pop() ?? fileName;
+    const entry = (Object.values(MODELS) as ModelSpec[]).find(
+      (m) => m.fileName.toLowerCase() === base.toLowerCase(),
+    );
+    return entry?.tier;
+  }
+
+  /**
+   * D:导入本地模型文件命令(`voiceflow.importModel`)。文件选择器 → 复制到 globalStorage
+   * (存为该档位的规范文件名)→ 写回 `voiceflow.model`。合规渠道拿到的模型无需下载即可用。
+   */
+  async pickAndImport(): Promise<void> {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      filters: { 'whisper model': ['bin'] },
+      openLabel: 'Import',
+      title: 'Select a whisper model file (.bin) to import',
+    });
+    if (!picked || picked.length === 0) return;
+    const src = picked[0]!.fsPath;
+    const name = src.split(/[\\/]/).pop() ?? '';
+
+    let tier = this.tierFromFileName(name);
+    if (!tier) {
+      const items = (Object.values(MODELS) as ModelSpec[]).map((m) => ({
+        label: m.label,
+        detail: `stored as ${m.fileName}`,
+        tier: m.tier,
+      }));
+      const t = await vscode.window.showQuickPick(items, {
+        placeHolder: `Which tier is "${name}"? (it will be stored under that tier's expected filename)`,
+      });
+      if (!t) return;
+      tier = t.tier;
+    }
+
+    try {
+      await this.copyModelWithProgress(src, this.modelPath(tier), MODELS[tier]);
+      const cfg = vscode.workspace.getConfiguration('voiceflow');
+      await cfg.update('model', tier, vscode.ConfigurationTarget.Global);
+      this.log(`[model] imported ${MODELS[tier].fileName} from ${src}, set as current`);
+      void vscode.window.showInformationMessage(
+        `VoiceFlow: model ${tier} imported and set as current.`,
+      );
+    } catch (err) {
+      void vscode.window.showErrorMessage(`VoiceFlow: model import failed — ${String(err)}`);
+    }
   }
 
   /**
