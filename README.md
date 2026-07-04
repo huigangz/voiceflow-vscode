@@ -1,68 +1,68 @@
-# VoiceFlow for VS Code(preview)
+# VoiceFlow for VS Code (preview)
 
-Wispr Flow 式语音听写:按 `Ctrl+Alt+L` 说话,语音在**本地**转写为文字,经清理后插入当前聚焦的编辑器或集成终端。中英双语优化,面向中文开发者(代码注释、commit message、文档、给 AI 的 prompt)。
+Wispr Flow-style voice dictation: press `Ctrl+Alt+L` and speak — your speech is transcribed to text **locally**, cleaned up, and inserted into the focused editor or integrated terminal. Optimized for English and Chinese (and mixed), aimed at developers writing code comments, commit messages, docs, and prompts for AI.
 
-> **隐私声明**
-> 音频永不离开本机。启用 AI 清理时,**转写文本**会发送给你选择的模型服务(Copilot / Claude / Codex);rules-only 模式下文本也不出本机。
-> v0.1 零遥测。
+> **Privacy**
+> Audio never leaves your machine. When AI cleanup is enabled, the **transcribed text** is sent to the model service you choose (Copilot / Claude / Codex); in rules-only mode the text also stays on your machine.
+> Zero telemetry.
 
-## 快速开始
+## Quick start
 
-1. 安装 VSIX(GitHub Release,`win32-x64`)。whisper 二进制已内置,**无需任何手工配置**。
-2. 首次启动会弹出**设置向导**:确认隐私声明 → 选模型档位(默认 small)→ 下载模型(断点续传 + hf-mirror 国内镜像)→ 引导第一次听写。也可随时运行命令 `VoiceFlow: Setup Wizard` 重开,或 `VoiceFlow: Download / Switch Model` 换档。
-3. 光标放到编辑器或终端 → `Ctrl+Alt+L` 开始说话 → 再按结束(静音 3s 也会自动结束)→ 文字插入。
-4. 任何阶段按 `Esc` 取消整个会话。
+1. Install the VSIX (from the GitHub Release, `win32-x64`). The whisper binaries are bundled — **no manual configuration needed**.
+2. On first launch a **setup wizard** appears: confirm the privacy notice → pick a model tier (default `small`) → download the model (resumable, with an hf-mirror fallback for users in China) → try your first dictation. You can reopen it anytime via the `VoiceFlow: Setup Wizard` command, or switch tiers with `VoiceFlow: Download / Switch Model`.
+3. Focus an editor or terminal → `Ctrl+Alt+L` to start speaking → press again to stop (3s of silence also auto-stops) → the text is inserted.
+4. Press `Esc` at any stage to cancel the whole session.
 
-> **preview 为 CPU 版**:当前使用 whisper.cpp CPU 构建,small 档在普通开发机上端到端约 3 秒(含 AI 清理)。GPU 加速(Vulkan)在后续版本。
+> **The preview is a CPU build**: it uses a whisper.cpp CPU build; the `small` tier is about 3s end-to-end on a typical dev machine (including AI cleanup). GPU acceleration (Vulkan) is a later release.
 
-## 行为要点
+## How it behaves
 
-- 插入目标在**录音开始时**锁定;若结束时原编辑器已关闭 / 光标位置失效 / 终端已退出,文本会复制到剪贴板并提示
-- 终端插入**不自动回车、不代执行**——你自己确认后再按 Enter
-- 录音超过 30s 时,插入前会弹出确认预览(可在设置关闭)
-- AI 清理是增强层:不可用/超时(8s)时自动回落本地规则清理,听写永不被阻塞
-- 模型空闲 10 分钟自动卸载省内存(可设 0 常驻)
+- The insertion target is locked **when recording starts**; if by the end the original editor was closed / the cursor position became invalid / the terminal exited, the text is copied to the clipboard with a notice.
+- Terminal insertion **does not press Enter and never executes** — you confirm and press Enter yourself.
+- For recordings over 30s, a confirmation preview appears before inserting (can be disabled in settings).
+- AI cleanup is an enhancement layer: if it's unavailable or times out (8s), it falls back to local rules cleanup automatically — dictation is never blocked.
+- The model unloads after 10 minutes idle to save memory (set to 0 to keep it resident).
 
-## 已知限制
+## Known limitations
 
-### Smart App Control(智能应用控制)可能拦截录音
+### Smart App Control may block recording
 
-VoiceFlow 用一个小型本地程序(`voiceflow-mic.exe`)采集麦克风。Windows 11 的 **Smart App Control(SAC)** 会拦截**未签名、暂无信誉**的程序,而本 preview 的录音组件**尚未代码签名**。
+VoiceFlow uses a small local program (`voiceflow-mic.exe`) to capture the microphone. Windows 11's **Smart App Control (SAC)** blocks **unsigned programs without established reputation**, and this preview's recording component is **not yet code-signed**.
 
-- **现象**:开启 SAC 的机器上,**首次**按 `Ctrl+Alt+L` 可能提示"录音组件被智能应用控制拦截"。
-- **多为暂时性**:SAC 用微软信誉图谱(ISG)评估未知程序 —— 同一个固定二进制被"看到"并评估后通常会**自动放行**。**过一会儿再试**往往即可正常录音;本 preview 固定了单一 helper 二进制(不随构建变哈希),正是为了让它稳定地"养熟"放行,随下载量累积信誉也会改善。
-- **判断是否开启 SAC**:设置 → 隐私和安全性 → Windows 安全中心 → 应用和浏览器控制 → 智能应用控制。
-- **不建议为此关闭 SAC**:一旦关闭需重装系统才能重开。受控/企业环境如持续被拦,请等待后续**已签名**版本。
-- whisper 转写二进制来自 whisper.cpp 官方 release、具备信誉,不受影响;仅本地采集组件涉及此限制。
-- 正式发布前将对录音组件代码签名以彻底消除此限制。
+- **Symptom**: on a machine with SAC on, the **first** `Ctrl+Alt+L` may report that the recording component was blocked by Smart App Control.
+- **Usually temporary**: SAC evaluates unknown programs via Microsoft's Intelligent Security Graph (ISG) — once the same fixed binary has been "seen" and evaluated, it is typically allowed automatically. **Wait a moment and try again** and it usually works. This preview pins a single helper binary (its hash doesn't change across builds) precisely so it can "age in," and reputation improves as downloads accumulate.
+- **How to check SAC**: Settings → Privacy & security → Windows Security → App & browser control → Smart App Control.
+- **Don't turn SAC off for this**: once disabled it can't be re-enabled without reinstalling Windows. In managed/enterprise environments where it stays blocked, please wait for a future **signed** build.
+- The whisper transcription binaries come from whisper.cpp's official release and have reputation, so they are unaffected; only the local capture component is involved.
+- The recording component will be code-signed before a wider release to remove this limitation entirely.
 
-### 其他
+### Other
 
-- `Ctrl+Alt+L` 与 IntelliJ IDEA Keymap 扩展的默认绑定冲突,可在 Keyboard Shortcuts 中改绑
-- 不支持插入 Copilot Chat 输入框(VS Code 无公开 API)
-- 仅 Windows x64;macOS/Linux 计划 v2
-- 不支持按住说话(push-to-talk);Remote/WSL 支持为验证目标,限制以实测为准
-- 流式边说边出字暂不支持
+- `Ctrl+Alt+L` conflicts with the default binding of the IntelliJ IDEA Keymap extension — rebind it in Keyboard Shortcuts if needed.
+- Inserting into the Copilot Chat input box is not supported (no public VS Code API).
+- Windows x64 only; macOS/Linux planned for v2.
+- No push-to-talk; Remote/WSL support is a verification target, with limitations documented as tested.
+- Streaming (words appearing as you speak) is not supported yet.
 
-## 主要设置
+## Key settings
 
-| 设置 | 默认 | 说明 |
+| Setting | Default | Description |
 |---|---|---|
-| `voiceflow.language` | `auto` | 自动检测中/英(实测可靠);`zh` 会把纯英文语音翻译成中文,仅在 auto 误检时手动指定 |
-| `voiceflow.model` | `small` | 模型档位(CPU 版实测:small 均衡·推荐;向导可换档) |
-| `voiceflow.cleanup.provider` | `auto` | `auto`(rules + Copilot 可用则用)/ `rules-only` / `claude-cli` / `codex-cli` |
-| `voiceflow.recording.autoStopSilence` | `3` | 静音自动结束(秒,0=关) |
-| `voiceflow.whisper.idleUnload` | `10` | 模型空闲卸载(分钟,0=常驻) |
-| `voiceflow.rules.*` | `true` | 各条本地清理规则独立开关 |
+| `voiceflow.language` | `auto` | Auto-detects Chinese/English (reliable in testing); `zh` translates pure-English speech into Chinese, so only set it manually if auto mis-detects. |
+| `voiceflow.model` | `small` | Model tier (CPU build: `small` is balanced and recommended; switch via the wizard). |
+| `voiceflow.cleanup.provider` | `auto` | `auto` (rules + Copilot when available) / `rules-only` / `claude-cli` / `codex-cli`. |
+| `voiceflow.recording.autoStopSilence` | `3` | Auto-stop on silence (seconds, 0 = off). |
+| `voiceflow.whisper.idleUnload` | `10` | Unload the model when idle (minutes, 0 = keep resident). |
+| `voiceflow.rules.*` | `true` | Independent toggles for each local cleanup rule. |
 
-完整设置见 VS Code 设置页搜索 "voiceflow"。
+For all settings, search "voiceflow" in VS Code settings.
 
-## 开源属性
+## Open source
 
-VoiceFlow 本体 MIT。VSIX 实际分发的第三方组件(无 GPL 传染,详见 `THIRD-PARTY-NOTICES.md`):
+VoiceFlow itself is MIT. Third-party components actually distributed in the VSIX (no GPL contamination; see `THIRD-PARTY-NOTICES.md`):
 
-- **whisper.cpp**(v1.9.1 CPU 构建,MIT)—— 本地转写二进制
-- **Whisper ggml 模型**(MIT)—— 用户首启下载
-- **opencc-js**(MIT + Apache-2.0)—— 繁体转简体
+- **whisper.cpp** (v1.9.1 CPU build, MIT) — local transcription binaries
+- **Whisper ggml models** (MIT) — downloaded on first run
+- **opencc-js** (MIT + Apache-2.0) — Traditional→Simplified Chinese conversion
 
-> preview 采用 whisper.cpp 的 **CPU(no-BLAS)** 构建,不含 OpenBLAS。`@ricky0123/vad-web` / `onnxruntime-web` 仅为暂不可用的实验性 webview 录音路线的依赖,**不随 VSIX 分发**。
+> The preview uses whisper.cpp's **CPU (no-BLAS)** build and does not include OpenBLAS. `@ricky0123/vad-web` / `onnxruntime-web` are dependencies of the currently-unavailable experimental webview recording path and are **not distributed in the VSIX**.
