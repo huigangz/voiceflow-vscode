@@ -6,6 +6,8 @@
  * ② source=="whisper" 的文件:逐一校验 SHA-256。
  * ③ voiceflow-mic.exe(verify=="format"):只校验 存在 + 非空 + PE 头(MZ)。
  *    (.NET Framework csc.exe 无 /deterministic,重编译哈希会变 → 不固定 SHA。)
+ * ④ P2a:manifest.nodeAddons —— node_modules 内 native addon 逐一校验 存在 + SHA-256
+ *    (fail-closed:pin 升级未同步更新 manifest、包被篡改/损坏都在打包前拦下)。
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -49,9 +51,23 @@ for (const [name, meta] of Object.entries(manifest.files)) {
   }
 }
 
+// ④ P2a:nodeAddons 校验(路径相对仓库根)
+const addonCount = Object.keys(manifest.nodeAddons ?? {}).length;
+for (const [relPath, meta] of Object.entries(manifest.nodeAddons ?? {})) {
+  const p = join(root, relPath);
+  if (!existsSync(p)) {
+    errors.push(`nodeAddon 缺失: ${relPath}(先 npm install)`);
+    continue;
+  }
+  const h = createHash('sha256').update(readFileSync(p)).digest('hex');
+  if (h !== meta.sha256) {
+    errors.push(`nodeAddon SHA-256 不匹配: ${relPath}\n    期望 ${meta.sha256}\n    实际 ${h}\n    (pin 升级需同步更新 manifest;否则疑似篡改/损坏)`);
+  }
+}
+
 if (errors.length > 0) {
-  console.error(`[verify-bin] FAIL —— bin/ 与 manifest 不符(${errors.length} 项):`);
+  console.error(`[verify-bin] FAIL —— 与 manifest 不符(${errors.length} 项):`);
   for (const e of errors) console.error(`  - ${e}`);
   process.exit(1);
 }
-console.log(`[verify-bin] OK: bin/ 与 manifest 精确匹配(${expected.size} 文件,SHA/格式校验通过)`);
+console.log(`[verify-bin] OK: bin/ ${expected.size} 文件 + nodeAddons ${addonCount} 项,SHA/格式校验全部通过`);

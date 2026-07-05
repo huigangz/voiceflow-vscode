@@ -7,12 +7,23 @@ import { Session } from './session';
 // WebviewRecorder 源码保留但运行时不可达(webview 无麦克风权限,microsoft/vscode#250568);
 // 不再 import,避免打包无用代码。
 import { HelperRecorder } from './audio/helperRecorder';
+import { AddonRecorder } from './audio/addonRecorder';
 import { RecordingController, cleanTmpWavs } from './audio/recordingController';
-import { RecorderError } from './audio/recorder';
+import { SegmentedRecordingController } from './audio/segmentedRecordingController';
+import { Recorder, RecorderError } from './audio/recorder';
 import { ModelManager, ModelTier } from './stt/modelManager';
-import { DEFAULT_INITIAL_PROMPT, WhisperMode, WhisperRunner } from './stt/whisperRunner';
+import {
+  DEFAULT_INITIAL_PROMPT,
+  WhisperError,
+  WhisperMode,
+  WhisperRunner,
+  resolveWhisperMode,
+} from './stt/whisperRunner';
 import { FocusHint, InsertTarget, captureTarget, dispatchInsert } from './insert/dispatcher';
-import { RulesConfig } from './cleanup/rulesLayer';
+import { SegmentInserter } from './insert/segmentInserter';
+import { SegmentPipeline } from './segment/pipeline';
+import { validateSegmentedConfig } from './segment/config';
+import { RulesConfig, applyRules } from './cleanup/rulesLayer';
 import { CleanupCancelled, EnhanceProvider, runCleanup } from './cleanup/pipeline';
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
 import { CliKind, createCliProvider } from './cleanup/cliProvider';
@@ -26,8 +37,27 @@ let extContext: vscode.ExtensionContext;
 let modelManager: ModelManager;
 let whisper: WhisperRunner | undefined;
 let insertTarget: InsertTarget = { kind: 'none' };
+/** 会话级转写取消(v12-①:runner 无实例级 cancel,取消所有权归调用方)。 */
+let sttAbort: AbortController | undefined;
 let cleaningAbort: AbortController | undefined;
 let statusBar: StatusBar;
+/**
+ * P2a 回退链(评审 ⑥/v7-②):addon 首次 start 失败且 code 为 module-unavailable /
+ * blocked-by-policy → 当次回退 HelperRecorder,并在运行期记住(按 code,不靠 message)。
+ * 仅 auto 模式回退;显式 addon = 用户强制,失败直接呈现。
+ */
+let addonFallbackCode: 'module-unavailable' | 'blocked-by-policy' | undefined;
+
+/** P2b:segmented 会话(与 batch 的 `recording` 互斥;同一时刻只有一种会话形态)。 */
+interface SegmentedSession {
+  controller: SegmentedRecordingController;
+  pipeline: SegmentPipeline;
+  inserter: SegmentInserter;
+  releaseLease: (() => void) | undefined;
+  pending: number;
+  stopping: boolean;
+}
+let segmented: SegmentedSession | undefined;
 
 function log(line: string): void {
   output.appendLine(`${new Date().toISOString().slice(11, 23)} ${line}`);
@@ -67,8 +97,20 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('voiceflow.openSetupWizard', () =>
       runSetupWizard({ context, modelManager, log }),
     ),
-    // Reload Window gate:销毁 helper/音频流 + kill whisper 子进程
-    { dispose: () => { recording?.dispose(); whisper?.dispose(); } },
+    // Reload Window gate:销毁 helper/音频流/分段会话 + kill whisper 子进程
+    // (分段 Reload:异步剪贴板写入无法保证 → 已知限制,不持久化文本,v4-②)
+    {
+      dispose: () => {
+        recording?.dispose();
+        if (segmented) {
+          segmented.pipeline.cancel();
+          segmented.controller?.dispose();
+          segmented.releaseLease?.();
+          segmented = undefined;
+        }
+        whisper?.dispose();
+      },
+    },
   );
 
   // 首启邀请(F5):仅 pending 弹一次;不阻塞 activate
@@ -102,24 +144,24 @@ async function toggleDictation(args?: { focus?: FocusHint }): Promise<void> {
   if (session.state === 'idle') {
     await startRecording(args?.focus);
   } else if (session.state === 'recording') {
-    await stopRecordingAndProcess('toggle');
+    if (segmented) await stopSegmentedSession('toggle');
+    else await stopRecordingAndProcess('toggle');
   }
-  // 其他阶段:toggle 无效(取消走 Esc,spec §5.3)
+  // 其他阶段(含 draining):toggle 无效(取消走 Esc,spec §5.3)
 }
 
-async function startRecording(focusHint: FocusHint): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration('voiceflow');
-  // F4:插入目标在录音开始时锁定
-  insertTarget = captureTarget(focusHint);
-  log(`[dictation] target locked: ${insertTarget.kind}`);
-  // P3 已收敛(2026-07-03):webview 无麦克风权限(upstream microsoft/vscode#250568)→
-  // 硬编码 native helper exe。WebviewRecorder 源码保留但运行时不可达,无配置可路由到它
-  // (旧的 "voiceflow.recorder": "webview" 设置升级后无效,不会再走坏分支)。
-  const recorder = new HelperRecorder(
-    vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-mic.exe').fsPath,
-    log,
-  );
-  recording = new RecordingController(
+/** P2a:按配置与运行期回退状态选录音后端。webview 路线已 No-Go(microsoft/vscode#250568),不在枚举内。 */
+function makeRecorder(kind: 'addon' | 'helper'): Recorder {
+  return kind === 'addon'
+    ? new AddonRecorder(log)
+    : new HelperRecorder(
+        vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-mic.exe').fsPath,
+        log,
+      );
+}
+
+function buildController(recorder: Recorder, cfg: vscode.WorkspaceConfiguration): RecordingController {
+  const controller = new RecordingController(
     recorder,
     {
       maxDurationMs: cfg.get<number>('recording.maxDuration', 120) * 1000,
@@ -128,11 +170,11 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
     extContext.globalStorageUri,
     log,
   );
-  recording.onAutoStop = (reason) => {
+  controller.onAutoStop = (reason) => {
     log(`[recording] auto-stop: ${reason}`);
     void stopRecordingAndProcess(reason);
   };
-  recording.onError = (err: RecorderError) => {
+  controller.onError = (err: RecorderError) => {
     log(`[recording] failed: ${err.code} — ${err.message}`);
     session.dispatch('error');
     statusBar.showError(`Recording failed: ${err.code}`);
@@ -140,20 +182,295 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
     recording = undefined;
     void showRecorderError(err);
   };
+  return controller;
+}
 
+/** 回退提示按 code 区分(评审 v6-⑦:策略拦截指引 README vs 安装损坏建议重装,防坏包被静默掩盖)。 */
+function notifyAddonFallback(code: 'module-unavailable' | 'blocked-by-policy'): void {
+  const msg =
+    code === 'blocked-by-policy'
+      ? 'VoiceFlow: the native recording module was blocked by Windows app control policy (Smart App Control); switched to the helper recorder. See "Known limitations · Smart App Control" in the README.'
+      : 'VoiceFlow: the native recording module failed to load (the installation may be corrupted); switched to the helper recorder. If this persists, try reinstalling the extension.';
+  void vscode.window.showWarningMessage(msg);
+}
+
+/**
+ * 录音后端选择 + 回退链(2a,评审 ⑥/v7-②)的通用外壳:batch/segmented 共用。
+ * 仅 auto 模式 + addon + {module-unavailable, blocked-by-policy} → 当次切 helper 重试一次
+ * 并运行期记住;其余错误直接抛给调用方呈现。
+ */
+async function startWithRecorderFallback<T extends { start(): Promise<void>; dispose(): void }>(
+  cfg: vscode.WorkspaceConfiguration,
+  build: (recorder: Recorder) => T,
+): Promise<T> {
+  const setting = cfg.get<'auto' | 'addon' | 'helper'>('recorder', 'auto');
+  const kind: 'addon' | 'helper' =
+    setting === 'helper' ? 'helper'
+    : setting === 'addon' ? 'addon'
+    : addonFallbackCode ? 'helper' : 'addon';
+  let ctrl = build(makeRecorder(kind));
+  try {
+    await ctrl.start();
+    log(`[dictation] recording via ${kind}… (press Ctrl+Alt+L to stop, Esc to cancel)`);
+    return ctrl;
+  } catch (err) {
+    ctrl.dispose();
+    if (
+      setting === 'auto' &&
+      kind === 'addon' &&
+      err instanceof RecorderError &&
+      (err.code === 'module-unavailable' || err.code === 'blocked-by-policy')
+    ) {
+      addonFallbackCode = err.code;
+      log(`[recorder] addon start failed (${err.code}) — falling back to helper for this runtime`);
+      notifyAddonFallback(err.code);
+      ctrl = build(makeRecorder('helper'));
+      await ctrl.start();
+      log('[dictation] recording via helper (fallback)…');
+      return ctrl;
+    }
+    throw err;
+  }
+}
+
+async function startRecording(focusHint: FocusHint): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('voiceflow');
+  if (cfg.get<'batch' | 'segmented'>('output.mode', 'batch') === 'segmented') {
+    return startSegmentedSession(cfg, focusHint);
+  }
+  return startBatchSession(cfg, focusHint);
+}
+
+async function startBatchSession(
+  cfg: vscode.WorkspaceConfiguration,
+  focusHint: FocusHint,
+): Promise<void> {
+  // F4:插入目标在录音开始时锁定
+  insertTarget = captureTarget(focusHint);
+  log(`[dictation] target locked: ${insertTarget.kind}`);
   session.dispatch('start');
   try {
-    await recording.start();
+    recording = await startWithRecorderFallback(cfg, (r) => buildController(r, cfg));
     statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
-    log('[dictation] recording… (press Ctrl+Alt+L to stop, Esc to cancel)');
   } catch (err) {
     session.dispatch('error');
     statusBar.showError('Failed to start recording');
-    recording.dispose();
+    recording?.dispose();
     recording = undefined;
     if (err instanceof RecorderError) void showRecorderError(err);
     else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
   }
+}
+
+// ---------- P2b:segmented 会话编排 ----------
+
+async function startSegmentedSession(
+  cfg: vscode.WorkspaceConfiguration,
+  focusHint: FocusHint,
+): Promise<void> {
+  // ① 配置校验(评审 v5-②/v7-⑥:非法值拒绝进入,不静默 clamp)
+  const valid = validateSegmentedConfig({
+    segmentPauseS: cfg.get('output.segmentPause', 1.5),
+    autoStopSilenceS: cfg.get<number>('recording.autoStopSilence', 3),
+  });
+  if (!valid.ok) {
+    statusBar.showError('Segmented config error');
+    void vscode.window.showErrorMessage(`VoiceFlow: ${valid.error}`);
+    return;
+  }
+  // ② server 形态准入(评审 v8-⑤:CLI 显式拒绝不静默降级;v10-③/v11-⑤:快速判定不碰模型)
+  const binaryDir =
+    cfg.get<string>('whisper.binaryDir', '') ||
+    vscode.Uri.joinPath(extContext.extensionUri, 'bin').fsPath;
+  const whisperMode = await resolveWhisperMode(
+    binaryDir,
+    cfg.get<WhisperMode | 'auto'>('whisper.mode', 'auto'),
+  );
+  if (whisperMode === 'cli') {
+    statusBar.showError('Segmented requires whisper server');
+    void vscode.window.showErrorMessage(
+      'VoiceFlow: segmented mode requires the whisper server binary (per-segment CLI cold-load latency is unacceptable). ' +
+        'Restore whisper-server.exe or set "voiceflow.output.mode" back to "batch".',
+    );
+    return;
+  }
+
+  insertTarget = captureTarget(focusHint);
+  log(`[dictation] target locked: ${insertTarget.kind} (segmented)`);
+  const inserter = new SegmentInserter(insertTarget, log);
+
+  // ③ 并行预热(评审 v6-⑥):会话 lease 先行(v11-②);prepare 失败不阻会话,首段会再试
+  const warmup = (async () => {
+    const runner = await getWhisper(); // 含模型确保(首次可能下载)
+    const release = runner.acquireLease();
+    runner.prepare().catch((e: unknown) =>
+      log(`[whisper] warmup failed (first segment will retry): ${String((e as Error)?.message ?? e)}`),
+    );
+    return { runner, release };
+  })();
+
+  const seg: SegmentedSession = {
+    controller: undefined as unknown as SegmentedRecordingController,
+    pipeline: undefined as unknown as SegmentPipeline,
+    inserter,
+    releaseLease: undefined,
+    pending: 0,
+    stopping: false,
+  };
+  warmup.then(
+    ({ release }) => { seg.releaseLease = release; },
+    () => { /* 预热失败:首段 transcribe 走同一失败路径(fatal 显式终止) */ },
+  );
+
+  const rulesCfg = getRulesConfig();
+  // 会话语言锁定(评审 ⑤ + v9-⑦):仅 language=auto 参与;首个语音 ≥2s 的段锁定(过短首段不锁);
+  // detected_language 拿不到(如 CLI)则维持逐段 auto。锁定状态由管线闭包持有,不污染 cfg。
+  const baseLanguage = cfg.get<'zh' | 'en' | 'auto'>('language', 'auto');
+  let lockedLanguage: 'zh' | 'en' | undefined;
+  let firstSegmentDone = false;
+  const MIN_LOCK_SPEECH_MS = 2000;
+  const pipeline = new SegmentPipeline({
+    transcribe: async (wav, signal, s) => {
+      const { runner } = await warmup;
+      const r = await runner.transcribe(wav, { signal, language: lockedLanguage });
+      // 首段 cold latency 单列(评审 v6-⑥,不计入 P50/P95)
+      log(
+        `[metrics] segment #${s.index}${firstSegmentDone ? '' : ' (first)'} ` +
+          `cold=${r.coldStartMs ?? 0}ms warm=${r.transcribeMs}ms ` +
+          `lang=${lockedLanguage ?? baseLanguage}${r.detectedLanguage ? ` detected=${r.detectedLanguage}` : ''}`,
+      );
+      firstSegmentDone = true;
+      if (baseLanguage === 'auto' && lockedLanguage === undefined && s.speechMs >= MIN_LOCK_SPEECH_MS) {
+        const mapped =
+          r.detectedLanguage === 'chinese' ? 'zh' : r.detectedLanguage === 'english' ? 'en' : undefined;
+        if (mapped) {
+          lockedLanguage = mapped;
+          log(`[dictation] session language locked: ${mapped} (segment #${s.index}, speech ${(s.speechMs / 1000).toFixed(1)}s)`);
+        }
+      }
+      return r.text;
+    },
+    cleanup: (raw) => applyRules(raw, rulesCfg), // v1:分段只做规则清理(D2 定 LLM 是否按段开)
+    insert: async (text) => inserter.insertSegment(text),
+    deleteWav: async (p) => {
+      seg.pending = Math.max(0, seg.pending - 1); // 每段恰好删一次(成败同待遇)→ 计数在此收敛
+      statusBar.setSegmentActivity(seg.pending);
+      try {
+        await vscode.workspace.fs.delete(vscode.Uri.file(p));
+      } catch { /* 已被清扫 */ }
+    },
+    log,
+    onFatal: (err) => {
+      // 显式终止(评审 ③):停录 + 状态栏错误 + flush 兜底,绝不静默缺句
+      statusBar.showError('Dictation failed');
+      void vscode.window.showErrorMessage(`VoiceFlow: ${err.message}`);
+      inserter.flushFallback('fatal'); // 错误路径销毁管线前先 flush(v4-②)
+      teardownSegmented('error');
+    },
+    onBacklogLimit: () => {
+      // v12-②:停采集,已入队段照常 drain 全部出字
+      void vscode.window.showWarningMessage(
+        'VoiceFlow: transcription is falling behind — recording stopped early. Queued segments will still be inserted.',
+      );
+      void stopSegmentedSession('backlog');
+    },
+  });
+  seg.pipeline = pipeline;
+
+  session.dispatch('start');
+  try {
+    seg.controller = await startWithRecorderFallback(cfg, (r) => {
+      const c = new SegmentedRecordingController(
+        r,
+        {
+          maxDurationMs: cfg.get<number>('recording.maxDuration', 120) * 1000,
+          autoStopSilenceMs: cfg.get<number>('recording.autoStopSilence', 3) * 1000,
+        },
+        valid.segmentPauseMs,
+        extContext.globalStorageUri,
+        log,
+      );
+      c.onSegment = (s) => {
+        seg.pending++;
+        statusBar.setSegmentActivity(seg.pending);
+        pipeline.enqueue({
+          wavPath: s.wavUri.fsPath,
+          index: s.index,
+          startMs: s.startMs,
+          endMs: s.endMs,
+          speechMs: s.speechMs,
+        });
+      };
+      c.onSegmentError = (err) => {
+        // 段 WAV 落盘失败 = 内容已丢 → 显式终止(评审 ③)
+        statusBar.showError('Dictation failed');
+        void vscode.window.showErrorMessage(`VoiceFlow: failed to persist a segment — ${err.message}`);
+        inserter.flushFallback('segment-write-failed');
+        teardownSegmented('error');
+      };
+      c.onAutoStop = (reason) => {
+        log(`[recording] auto-stop: ${reason}`);
+        void stopSegmentedSession(reason);
+      };
+      c.onError = (err) => {
+        // device-lost 等:在途段全弃(S1 按段重申),已插入保留,累计 flush(v4-②)
+        log(`[recording] failed: ${err.code} — ${err.message}`);
+        inserter.flushFallback('device-lost');
+        statusBar.showError(`Recording failed: ${err.code}`);
+        teardownSegmented('error');
+        void showRecorderError(err);
+      };
+      return c;
+    });
+    segmented = seg;
+    statusBar.recordingLive();
+  } catch (err) {
+    pipeline.cancel();
+    seg.releaseLease?.();
+    session.dispatch('error');
+    statusBar.showError('Failed to start recording');
+    if (err instanceof RecorderError) void showRecorderError(err);
+    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
+  }
+}
+
+/** 正常停止(热键/自动停/backlog):封口尾段 → drain FIFO 全部段完成 → 终端确认/兜底 flush → idle。 */
+async function stopSegmentedSession(reason: string): Promise<void> {
+  const s = segmented;
+  if (!s || s.stopping || session.state !== 'recording') return;
+  s.stopping = true;
+  log(`[dictation] segmented stop(${reason})`);
+  session.dispatch('drainStart');
+  try {
+    const { durationMs } = await s.controller.finish(); // 冲刷尾帧 + 封口尾段 + 段 WAV 全落盘
+    log(`[dictation] recording ended (${durationMs}ms), draining ${s.pending} pending segment(s)…`);
+    await s.pipeline.drained();
+    if (segmented !== s) return; // drain 期间 fatal/Esc 已 teardown
+    await s.inserter.finishSession(); // 终端 Send/Copy 确认(v7-⑤)/ 累计入剪贴板(v4-② 正常停止路径)
+    segmented = undefined;
+    s.controller.dispose();
+    s.releaseLease?.();
+    statusBar.setSegmentActivity(0);
+    session.dispatch('drained');
+    log(`[metrics] segmented session done: inserted=${s.inserter.stats.inserted}`);
+  } catch (err) {
+    log(`[dictation] segmented stop failed: ${String(err)}`);
+    s.inserter.flushFallback('stop-error');
+    teardownSegmented('error');
+  }
+}
+
+/** 错误/取消统一收尾:管线取消(删未提交段)、控制器销毁、lease 释放、会话回 idle。幂等。 */
+function teardownSegmented(kind: 'error' | 'cancel'): void {
+  const s = segmented;
+  if (!s) return;
+  segmented = undefined;
+  s.pipeline.cancel();
+  s.controller?.cancel();
+  s.controller?.dispose();
+  s.releaseLease?.();
+  statusBar.setSegmentActivity(0);
+  session.dispatch(kind);
 }
 
 async function stopRecordingAndProcess(reason: string): Promise<void> {
@@ -173,7 +490,9 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
 
     // Step 2:whisper 转写(埋点:cold start 与 warm 分开,§8.1)
     const runner = await getWhisper();
-    const stt = await runner.transcribe(result.wavUri.fsPath);
+    sttAbort = new AbortController();
+    const stt = await runner.transcribe(result.wavUri.fsPath, { signal: sttAbort.signal });
+    sttAbort = undefined;
     if ((session.state as string) !== 'transcribing') return; // Esc 已取消
     log(
       `[metrics] coldStart=${stt.coldStartMs ?? 0}ms warmTranscribe=${stt.transcribeMs}ms mode=${stt.mode}`,
@@ -236,8 +555,8 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     session.dispatch('inserted');
     log(`[metrics] insert=${Date.now() - t0}ms outcome=${outcome}`);
   } catch (err) {
-    if (err instanceof CleanupCancelled) {
-      log('[dictation] cleanup cancelled by user');
+    if (err instanceof CleanupCancelled || (err instanceof WhisperError && err.kind === 'cancelled')) {
+      log('[dictation] cancelled by user');
       return; // 会话已由 cancelSession 置回 idle
     }
     session.dispatch('error');
@@ -282,10 +601,19 @@ function getRulesConfig(): RulesConfig {
 
 function cancelSession(): void {
   if (!session.active) return;
+  if (segmented) {
+    // 分段 Esc 语义(spec §5.3 修订):停录 + abort 在途 + 删未提交段文件,已插入的段不回收;
+    // 已完成未插入的累计文本先 flush(v4-② Esc 路径)
+    segmented.inserter.flushFallback('esc');
+    teardownSegmented('cancel');
+    log('[dictation] segmented session cancelled (Esc)');
+    return;
+  }
   recording?.cancel();
   recording?.dispose();
   recording = undefined;
-  whisper?.cancel(); // 中止进行中的转写(CLI kill / HTTP abort;server 进程保留)
+  sttAbort?.abort(); // 中止进行中的转写(CLI kill / HTTP abort;server 进程保留,v10-① 双信号)
+  sttAbort = undefined;
   cleaningAbort?.abort(); // 中止进行中的清理(LLM 请求 / CLI 子进程)
   cleaningAbort = undefined;
   session.dispatch('cancel');
@@ -301,7 +629,9 @@ async function showRecorderError(err: RecorderError): Promise<void> {
     'device-lost': 'VoiceFlow: the recording device was disconnected; this recording was discarded. Please start again.',
     'blocked-by-policy':
       'VoiceFlow: the recording component was blocked by Windows Smart App Control (which blocks unsigned programs). ' +
-      'This is a known preview limitation (the recording helper is not yet code-signed). It is usually temporary — wait a moment and try again. See the "Known limitations · Smart App Control" section in the README.',
+      'This is a known preview limitation (the recording component is not yet code-signed). It is usually temporary — wait a moment and try again. See the "Known limitations · Smart App Control" section in the README.',
+    'module-unavailable':
+      'VoiceFlow: the native recording module failed to load. Set "voiceflow.recorder" to "auto" or "helper" to use the helper recorder, or reinstall the extension. See the logs (VoiceFlow: Show Logs).',
     'init-failed': 'VoiceFlow: failed to initialize recording. See the logs (VoiceFlow: Show Logs).',
   };
   const isPolicy = err.code === 'blocked-by-policy';
@@ -314,6 +644,12 @@ async function showRecorderError(err: RecorderError): Promise<void> {
 export function deactivate(): void {
   recording?.dispose();
   recording = undefined;
+  if (segmented) {
+    segmented.pipeline.cancel();
+    segmented.controller?.dispose();
+    segmented.releaseLease?.();
+    segmented = undefined;
+  }
   whisper?.dispose(); // Reload Window gate:kill whisper server,无残留进程
   whisper = undefined;
 }

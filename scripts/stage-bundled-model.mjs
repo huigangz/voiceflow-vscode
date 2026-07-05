@@ -9,7 +9,7 @@
  *   node scripts/stage-bundled-model.mjs --tier small-q5
  *   node scripts/stage-bundled-model.mjs --from <path>   # 从指定 .bin 复制(合规渠道拿到的文件)
  */
-import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,12 +17,12 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
 const getArg = (k) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
 
-// --clean:打包后清空暂存目录,使普通 npm run package 不会误打包大模型
+// 评审 v7-①:本脚本**永不删除任何文件**。普通 package 不带模型靠 .vscodeignore 排除
+// offline-model/**;offline 打包用 --ignoreFile .vscodeignore-offline。暂存模型留盘复用,
+// 需要清理时由用户手动删。
 if (argv.includes('--clean')) {
-  const dir = join(root, 'offline-model');
-  rmSync(dir, { recursive: true, force: true });
-  console.log('[stage-model] 已清空 offline-model/(普通 package 不受影响)');
-  process.exit(0);
+  console.error('[stage-model] --clean 已移除(评审 v7-①:脚本不做自动删除)。暂存模型请手动清理。');
+  process.exit(1);
 }
 
 // 档位 → 文件名(与 modelManager.MODELS 对齐)

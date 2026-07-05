@@ -51,6 +51,32 @@ describe('Session 状态机 (spec §5.3)', () => {
     expect(s2.state).toBe('idle');
   });
 
+  it('P2b segmented 主线: idle → recording → draining → idle', () => {
+    const s = new Session();
+    s.dispatch('start');
+    expect(s.dispatch('drainStart')).toBe(true);
+    expect(s.state).toBe('draining');
+    expect(s.active).toBe(true); // drain 期间 Esc keybinding 仍生效
+    expect(s.dispatch('drained')).toBe(true);
+    expect(s.state).toBe('idle');
+  });
+
+  it('P2b draining 中 Esc / error 回 idle;batch 路径不受 drainStart 影响', () => {
+    for (const evt of ['cancel', 'error'] as const) {
+      const s = new Session();
+      s.dispatch('start');
+      s.dispatch('drainStart');
+      expect(s.dispatch(evt)).toBe(true);
+      expect(s.state).toBe('idle');
+    }
+    // batch:transcribing 阶段 drainStart 非法
+    const s = new Session();
+    s.dispatch('start');
+    s.dispatch('stopRecording');
+    expect(s.dispatch('drainStart')).toBe(false);
+    expect(s.state).toBe('transcribing');
+  });
+
   it('active 与 transition 监听器', () => {
     const s = new Session();
     const seen: string[] = [];

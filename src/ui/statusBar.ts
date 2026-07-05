@@ -11,6 +11,9 @@ export class StatusBar implements vscode.Disposable {
   private timer: NodeJS.Timeout | undefined;
   private recordingSince = 0;
   private modelLoading = false;
+  /** P2b:管线中未完成段数(在录 + 在转并行呈现,spec §5.3 修订)。 */
+  private pendingSegments = 0;
+  private state: SessionState = 'idle';
 
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
@@ -19,6 +22,8 @@ export class StatusBar implements vscode.Disposable {
   }
 
   setSession(state: SessionState): void {
+    this.state = state;
+    if (state === 'idle') this.pendingSegments = 0;
     this.stopTimer();
     switch (state) {
       case 'idle':
@@ -52,7 +57,27 @@ export class StatusBar implements vscode.Disposable {
         this.item.text = '$(loading~spin) VoiceFlow: Inserting…';
         this.item.command = undefined;
         break;
+      case 'draining':
+        this.renderDraining();
+        this.item.tooltip = 'Esc to cancel (inserted segments are kept)';
+        this.item.command = 'voiceflow.cancelSession';
+        this.item.backgroundColor = undefined;
+        break;
     }
+  }
+
+  /** P2b:段管线活动计数(录音中显示 ✍N;draining 显示剩余)。 */
+  setSegmentActivity(pending: number): void {
+    this.pendingSegments = pending;
+    if (this.state === 'recording' && this.recordingSince > 0) this.renderRecording();
+    else if (this.state === 'draining') this.renderDraining();
+  }
+
+  private renderDraining(): void {
+    this.item.text =
+      this.pendingSegments > 0
+        ? `$(loading~spin) VoiceFlow: Finishing ${this.pendingSegments} segment(s)…`
+        : '$(loading~spin) VoiceFlow: Finishing…';
   }
 
   /** 麦克风就绪,开始亮红点计时(录音管线 start() resolve 后调用)。 */
@@ -86,7 +111,9 @@ export class StatusBar implements vscode.Disposable {
     const secs = Math.floor((Date.now() - this.recordingSince) / 1000);
     const mm = String(Math.floor(secs / 60)).padStart(2, '0');
     const ss = String(secs % 60).padStart(2, '0');
-    this.item.text = `$(record) VoiceFlow ${mm}:${ss}`;
+    // 在录 + 在转并行呈现(P2b:✍N = 管线中未完成段数)
+    const seg = this.pendingSegments > 0 ? ` ✍${this.pendingSegments}` : '';
+    this.item.text = `$(record) VoiceFlow ${mm}:${ss}${seg}`;
   }
 
   private stopTimer(): void {

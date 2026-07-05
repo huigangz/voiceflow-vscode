@@ -26,5 +26,13 @@
     "ggml-cpu-skylakex.dll": { "source": "whisper", "sha256": "06082dc62a09a82fbba4aab49b2c049b96db84c5fc561a446a8ddbfb9b20bf86" },
     "ggml-cpu-sse42.dll": { "source": "whisper", "sha256": "9a8f55ff1dfad231aa6250ac52c330c5bfa5c4c37691c8b591a68b52090ce40c" },
     "ggml-cpu-x64.dll": { "source": "whisper", "sha256": "45ff644d301b8a1fffc7c5e3864205047360eb197814c7311f366d106bb5b19f" }
+  },
+  "nodeAddons": {
+    "node_modules/@picovoice/pvrecorder-node/lib/windows/amd64/pv_recorder.node": {
+      "package": "@picovoice/pvrecorder-node@1.2.9",
+      "license": "Apache-2.0",
+      "sha256": "4f6457d2b6b1fbe8bf33c259de6387b423c452ebaff791dfbdda7daedb90ac27",
+      "_note": "P2a:1.2.8/1.2.9 同哈希(worklog p2a1);npm tarball 原样分发,SAC 依赖全球共享哈希 ISG 养熟;升级 pin 时必须更新本 SHA"
+    }
   }
 }

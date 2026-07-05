@@ -27,6 +27,12 @@ If your environment blocks downloading model files (e.g. from HuggingFace), you 
 
 You can also manually place a `ggml-*.bin` in `%APPDATA%\Code\User\globalStorage\voiceflow-preview.voiceflow-vscode\models\` — it's detected automatically with no download.
 
+## What's new in 0.2.0
+
+- **In-process recording by default**: the microphone is now captured via a native module (PvRecorder) loaded inside VS Code — faster start, no helper process to spawn. If the native module can't load (e.g. blocked by app-control policy), VoiceFlow **falls back to the helper exe automatically** (`voiceflow.recorder` controls this).
+- **Segmented dictation (opt-in)**: set `voiceflow.output.mode` to `segmented` — pause ~1.5s while speaking and the finished sentence is transcribed and inserted while you keep talking. Editor targets insert per segment; terminal targets confirm once (Send / Copy) at the end. Already-inserted text is final — Esc keeps it and discards only unfinished segments.
+- **Language auto-detection fix**: in server mode, "auto" previously fell back to the server's default (**English**) — Chinese speech could come out as an English translation. Auto is now passed explicitly and detects correctly.
+
 ## How it behaves
 
 - The insertion target is locked **when recording starts**; if by the end the original editor was closed / the cursor position became invalid / the terminal exited, the text is copied to the clipboard with a notice.
@@ -39,7 +45,7 @@ You can also manually place a `ggml-*.bin` in `%APPDATA%\Code\User\globalStorage
 
 ### Smart App Control may block recording
 
-VoiceFlow uses a small local program (`voiceflow-mic.exe`) to capture the microphone. Windows 11's **Smart App Control (SAC)** blocks **unsigned programs without established reputation**, and this preview's recording component is **not yet code-signed**.
+Since 0.2.0 the microphone is captured by an in-process native module (`pv_recorder.node`, shipped unmodified from the official PvRecorder npm package — its hash is shared globally, so it generally has ISG reputation and passed our SAC fresh-install test). If it is ever blocked or fails to load, VoiceFlow falls back to a small helper program (`voiceflow-mic.exe`), which is **not yet code-signed** — Windows 11's **Smart App Control (SAC)** blocks **unsigned programs without established reputation**.
 
 - **Symptom**: on a machine with SAC on, the **first** `Ctrl+Alt+L` may report that the recording component was blocked by Smart App Control.
 - **Usually temporary**: SAC evaluates unknown programs via Microsoft's Intelligent Security Graph (ISG) — once the same fixed binary has been "seen" and evaluated, it is typically allowed automatically. **Wait a moment and try again** and it usually works. This preview pins a single helper binary (its hash doesn't change across builds) precisely so it can "age in," and reputation improves as downloads accumulate.
@@ -61,6 +67,9 @@ VoiceFlow uses a small local program (`voiceflow-mic.exe`) to capture the microp
 | Setting | Default | Description |
 |---|---|---|
 | `voiceflow.language` | `auto` | Auto-detects Chinese/English (reliable in testing); `zh` translates pure-English speech into Chinese, so only set it manually if auto mis-detects. |
+| `voiceflow.recorder` | `auto` | Recording backend: in-process native recorder with automatic helper fallback / `addon` / `helper`. |
+| `voiceflow.output.mode` | `batch` | `segmented` = cut a segment at each speech pause and insert incrementally. |
+| `voiceflow.output.segmentPause` | `1.5` | Segmented mode: silence (seconds) that cuts a segment; must stay below `autoStopSilence`. |
 | `voiceflow.model` | `small` | Model tier (CPU build: `small` is balanced and recommended; switch via the wizard). |
 | `voiceflow.cleanup.provider` | `auto` | `auto` (rules + Copilot when available) / `rules-only` / `claude-cli` / `codex-cli`. |
 | `voiceflow.recording.autoStopSilence` | `3` | Auto-stop on silence (seconds, 0 = off). |
@@ -76,5 +85,6 @@ VoiceFlow itself is MIT. Third-party components actually distributed in the VSIX
 - **whisper.cpp** (v1.9.1 CPU build, MIT) — local transcription binaries
 - **Whisper ggml models** (MIT) — downloaded on first run
 - **opencc-js** (MIT + Apache-2.0) — Traditional→Simplified Chinese conversion
+- **@picovoice/pvrecorder-node** (1.2.9, Apache-2.0) — in-process microphone capture (Windows x64 `pv_recorder.node`)
 
-> The preview uses whisper.cpp's **CPU (no-BLAS)** build and does not include OpenBLAS. `@ricky0123/vad-web` / `onnxruntime-web` are dependencies of the currently-unavailable experimental webview recording path and are **not distributed in the VSIX**.
+> The preview uses whisper.cpp's **CPU (no-BLAS)** build and does not include OpenBLAS.

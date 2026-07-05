@@ -19,7 +19,16 @@ describe('whisperRunner 纯逻辑', () => {
   });
 
   it('解析 server JSON 响应并 trim', () => {
-    expect(parseServerResponse('{"text":"  你好,世界。\\n"}')).toBe('你好,世界。');
+    expect(parseServerResponse('{"text":"  你好,世界。\\n"}')).toEqual({
+      text: '你好,世界。',
+      detectedLanguage: undefined,
+    });
+  });
+
+  it('verbose_json:detected_language 一并解析(P2b 语言锁定,评审 ⑤)', () => {
+    expect(
+      parseServerResponse('{"text":"你好","detected_language":"chinese","language":"chinese"}'),
+    ).toEqual({ text: '你好', detectedLanguage: 'chinese' });
   });
 
   it('server 返回 error 字段 → 抛错', () => {

@@ -2,7 +2,7 @@
   "name": "voiceflow-vscode",
   "displayName": "VoiceFlow",
   "description": "Wispr Flow-style local voice dictation: press a key and speak, transcribe locally with whisper, clean up, and insert into the editor or terminal. Audio never leaves your machine.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "publisher": "voiceflow-preview",
   "license": "MIT",
@@ -77,12 +77,22 @@
       {
         "command": "voiceflow.cancelSession",
         "key": "escape",
-        "when": "voiceflow.sessionActive"
+        "when": "voiceflow.sessionActive && !suggestWidgetVisible && !inSnippetMode && !renameInputVisible && !inlineSuggestionVisible && !parameterHintsVisible && !findWidgetVisible && !terminalFindVisible"
       }
     ],
     "configuration": {
       "title": "VoiceFlow",
       "properties": {
+        "voiceflow.recorder": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "addon",
+            "helper"
+          ],
+          "default": "auto",
+          "description": "Recording backend. auto = in-process native recorder (PvRecorder), falling back to the helper process automatically if the native module cannot load; addon = force the native recorder (no fallback); helper = force the helper exe."
+        },
         "voiceflow.language": {
           "type": "string",
           "enum": [
@@ -109,6 +119,21 @@
           "type": "string",
           "default": "",
           "description": "Custom model source for restricted networks. An https base URL (e.g. https://intranet/whisper-models) is used before HuggingFace — the model file name is appended. A local/UNC folder (e.g. \\\\server\\share\\models or D:\\models) is copied from directly. Leave empty to use HuggingFace + hf-mirror."
+        },
+        "voiceflow.output.mode": {
+          "type": "string",
+          "enum": [
+            "batch",
+            "segmented"
+          ],
+          "default": "batch",
+          "description": "Output mode. batch = insert everything after the recording ends (default); segmented = cut a segment at each speech pause and insert incrementally (editor targets insert per segment; terminal targets confirm once at session end)."
+        },
+        "voiceflow.output.segmentPause": {
+          "type": "number",
+          "default": 1.5,
+          "minimum": 0.5,
+          "description": "Segmented mode: a pause (silence) of this many seconds cuts a segment. Must be smaller than voiceflow.recording.autoStopSilence (when that is non-zero). Invalid values disable segmented mode with an error (never silently clamped)."
         },
         "voiceflow.cleanup.provider": {
           "type": "string",
@@ -190,7 +215,6 @@
     }
   },
   "scripts": {
-    "assets": "node scripts/copy-assets.mjs",
     "build:helper": "node scripts/place-helper.mjs",
     "build:helper:compile": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize /out:prebuilt\\voiceflow-mic.exe helper\\MicCapture.cs",
     "build:whisper": "node scripts/fetch-whisper.mjs",
@@ -205,7 +229,7 @@
     "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
     "package": "vsce package --target win32-x64",
     "stage-model": "node scripts/stage-bundled-model.mjs",
-    "package:bundled": "node scripts/stage-bundled-model.mjs && vsce package --target win32-x64 -o voiceflow-vscode-win32-x64-0.1.2-offline.vsix && node scripts/stage-bundled-model.mjs --clean"
+    "package:bundled": "node scripts/stage-bundled-model.mjs && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.2.0-offline.vsix"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
@@ -216,7 +240,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
-    "@ricky0123/vad-web": "^0.0.30",
+    "@picovoice/pvrecorder-node": "1.2.9",
     "opencc-js": "^1.4.0"
   }
 }
