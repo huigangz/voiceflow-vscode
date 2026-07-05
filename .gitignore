@@ -11,3 +11,6 @@ worklog/
 test/fixtures/*.exe
 voiceflow-phase1-plan.md
 voiceflow-vscode-spec-*.md
+voiceflow-phase2-review-log.md
+voiceflow-phase2-roadmap.md
+spike/
