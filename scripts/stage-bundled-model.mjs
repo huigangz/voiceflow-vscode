@@ -8,8 +8,11 @@
  *   node scripts/stage-bundled-model.mjs                 # tier=small,从本机 globalStorage 复制
  *   node scripts/stage-bundled-model.mjs --tier small-q5
  *   node scripts/stage-bundled-model.mjs --from <path>   # 从指定 .bin 复制(合规渠道拿到的文件)
+ *   node scripts/stage-bundled-model.mjs --onnx          # inproc-s5(E4):暂存 inprocess ONNX
+ *     目录(offline-model/onnx/onnx-community/whisper-small/,含完成标记;源 = 本机
+ *     globalStorage,或 --onnx-from <目录>)。受限网络(公司机)唯一现实交付。
  */
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -23,6 +26,42 @@ const getArg = (k) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] :
 if (argv.includes('--clean')) {
   console.error('[stage-model] --clean 已移除(评审 v7-①:脚本不做自动删除)。暂存模型请手动清理。');
   process.exit(1);
+}
+
+// inproc-s5(E4):ONNX 目录暂存分支(与 .bin 正交,--onnx 独立调用)
+if (argv.includes('--onnx')) {
+  const REPO = ['onnx-community', 'whisper-small']; // 与 src/stt/onnxModels.ts 清单对齐
+  const MARKER = '.voiceflow-complete';
+  const from =
+    getArg('--onnx-from') ??
+    join(
+      process.env.APPDATA,
+      'Code/User/globalStorage/voiceflow-preview.voiceflow-vscode/models/onnx',
+      ...REPO,
+    );
+  if (!existsSync(join(from, MARKER))) {
+    console.error(`[stage-model] ONNX 源无完成标记: ${join(from, MARKER)}`);
+    console.error('  先在本机 downloadModel 选 inprocess 档下载完成,或 --onnx-from <完整模型目录>。');
+    process.exit(1);
+  }
+  const destDir = join(root, 'offline-model', 'onnx', ...REPO);
+  const copyDir = (src, dst) => {
+    mkdirSync(dst, { recursive: true });
+    let bytes = 0;
+    for (const entry of readdirSync(src)) {
+      const s = join(src, entry);
+      const d = join(dst, entry);
+      if (statSync(s).isDirectory()) bytes += copyDir(s, d);
+      else {
+        copyFileSync(s, d);
+        bytes += statSync(s).size;
+      }
+    }
+    return bytes;
+  };
+  const bytes = copyDir(from, destDir);
+  console.log(`[stage-model] onnx small-q8 (${(bytes / 1e6).toFixed(0)}MB, 含完成标记) → offline-model/onnx/${REPO.join('/')}`);
+  process.exit(0);
 }
 
 // 档位 → 文件名(与 modelManager.MODELS 对齐)

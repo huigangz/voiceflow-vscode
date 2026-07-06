@@ -8,6 +8,9 @@
  *    (.NET Framework csc.exe 无 /deterministic,重编译哈希会变 → 不固定 SHA。)
  * ④ P2a:manifest.nodeAddons —— node_modules 内 native addon 逐一校验 存在 + SHA-256
  *    (fail-closed:pin 升级未同步更新 manifest、包被篡改/损坏都在打包前拦下)。
+ * ⑤ inproc-s5(v4-②):onnxruntime-node 依赖树**单副本**(transformers.js 自带 1.21,
+ *    overrides 钉到仓库 1.27;嵌套副本出现 = overrides 失效/依赖漂移 → 双 DLL 风险)。
+ * ⑥ inproc-s5:@huggingface/transformers 安装在位(esbuild 打进 bundle 的构建期依赖)。
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -65,9 +68,36 @@ for (const [relPath, meta] of Object.entries(manifest.nodeAddons ?? {})) {
   }
 }
 
+// ⑤ ORT 单副本(v4-②):递归找 node_modules 下所有 onnxruntime-node 目录,只允许根部一份
+function findDirs(base, name, depth = 0, out = []) {
+  if (depth > 6 || !existsSync(base)) return out;
+  for (const entry of readdirSync(base)) {
+    const p = join(base, entry);
+    let isDir = false;
+    try { isDir = statSync(p).isDirectory(); } catch { continue; }
+    if (!isDir) continue;
+    if (entry === name) out.push(p);
+    else if (entry === 'node_modules' || entry.startsWith('@')) findDirs(p, name, depth + 1, out);
+    else findDirs(join(p, 'node_modules'), name, depth + 1, out);
+  }
+  return out;
+}
+const ortCopies = findDirs(join(root, 'node_modules'), 'onnxruntime-node');
+if (ortCopies.length !== 1) {
+  errors.push(
+    `onnxruntime-node 副本数 ${ortCopies.length}(期望 1):\n    ${ortCopies.join('\n    ')}\n    (overrides 失效或依赖漂移 → 同进程双 DLL 风险,v4-②)`,
+  );
+}
+
+// ⑥ transformers 构建期依赖在位(bundle 进 dist,不再进 node_modules 打洞)
+const tfCjs = join(root, 'node_modules/@huggingface/transformers/dist/transformers.node.cjs');
+if (!existsSync(tfCjs)) errors.push('@huggingface/transformers 缺失(先 npm install;esbuild 需要它进 bundle)');
+
 if (errors.length > 0) {
   console.error(`[verify-bin] FAIL —— 与 manifest 不符(${errors.length} 项):`);
   for (const e of errors) console.error(`  - ${e}`);
   process.exit(1);
 }
-console.log(`[verify-bin] OK: bin/ ${expected.size} 文件 + nodeAddons ${addonCount} 项,SHA/格式校验全部通过`);
+console.log(
+  `[verify-bin] OK: bin/ ${expected.size} 文件 + nodeAddons ${addonCount} 项 + ORT 单副本 + transformers 在位,校验全部通过`,
+);

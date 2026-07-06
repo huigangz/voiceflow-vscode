@@ -13,8 +13,13 @@ Third-party components used at build/runtime and their licenses:
 | [@picovoice/pvrecorder-node](https://github.com/Picovoice/pvrecorder) 1.2.9 | In-process microphone capture (`pv_recorder.node`, Windows x64) | Apache-2.0 |
 | [miniaudio](https://github.com/mackron/miniaudio) 0.11.25 | System-audio (loopback) capture — compiled into our `voiceflow-audio.node` | MIT-0 (or public domain) |
 | [node-addon-api](https://github.com/nodejs/node-addon-api) | N-API C++ headers — compiled into `voiceflow-audio.node` | MIT |
-| [onnxruntime-node](https://github.com/microsoft/onnxruntime) 1.27.0 | Voice-activity-detection inference runtime (CPU; Windows x64 binaries) | MIT |
+| [onnxruntime-node](https://github.com/microsoft/onnxruntime) 1.27.0 | VAD + in-process whisper inference runtime (CPU; Windows x64 binaries) | MIT |
 | [Silero VAD](https://github.com/snakers4/silero-vad) v5 model (`silero_vad_v5.onnx`) | Voice activity detection for system-audio dictation | MIT |
+| [@huggingface/transformers](https://github.com/huggingface/transformers.js) 3.8.1 | In-process whisper engine for managed/company machines (minimal runtime: `package.json` + `dist/transformers.node.cjs`) | Apache-2.0 |
+| [onnx-community/whisper-small](https://huggingface.co/onnx-community/whisper-small) ONNX q8 (OpenAI Whisper weights) | In-process transcription model (downloaded on demand, or bundled in the offline VSIX) | MIT |
+
+Note: transformers.js requires `sharp` (image processing) at load time; VoiceFlow is audio-only and
+ships a 1KB inert stub in its place — **sharp and libvips binaries are not distributed**.
 
 Uses the whisper.cpp **CPU (no-BLAS)** build and **does not distribute OpenBLAS** (no BSD-3-Clause obligation).
 

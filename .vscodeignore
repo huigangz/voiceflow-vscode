@@ -26,7 +26,11 @@ node_modules/**
 !node_modules/onnxruntime-common/package.json
 !node_modules/onnxruntime-common/dist/cjs/*.js
 !node_modules/onnxruntime-common/dist/cjs/package.json
+# inproc-s5:transformers.js 打进 dist bundle(sharp 经 esbuild alias 指桩)——无 node_modules 打洞
 !media/vad/silero_vad_v5.onnx
+# inproc-s5 发现的 0.2.1 存量事故:test-audio(33MB 测试样本,含用户语音)曾被打进 VSIX
+test-audio/**
+stubs/**
 native/**
 esbuild.mjs
 tsconfig.json

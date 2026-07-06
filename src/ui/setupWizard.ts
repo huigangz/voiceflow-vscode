@@ -11,6 +11,7 @@ import * as os from 'node:os';
 import * as vscode from 'vscode';
 import { MODELS, ModelManager, ModelSpec, ModelTier } from '../stt/modelManager';
 import { DownloadError } from '../stt/download';
+import { InprocessTier } from '../stt/onnxModels';
 import { createVscodeLmProvider } from '../cleanup/vscodeLmProvider';
 
 export type SetupState = 'pending' | 'dismissed' | 'completed';
@@ -52,6 +53,27 @@ export async function runSetupWizard(deps: WizardDeps): Promise<void> {
   const ack = await vscode.window.showInformationMessage(PRIVACY, { modal: true }, 'Got it');
   if (ack !== 'Got it') return;
 
+  // ①.5 环境类型(inproc-s5,v5-①/v6-②:必须先于模型选择——受管机分支只给 ONNX,
+  //     绝不引导下载 .bin;显式设置保证零策略弹窗,不依赖探测)
+  const envKind = await vscode.window.showQuickPick(
+    [
+      {
+        label: '$(device-desktop) Standard machine',
+        detail: 'Personal / unmanaged PC — uses the whisper.cpp server engine (default).',
+        envKind: 'standard' as const,
+      },
+      {
+        label: '$(shield) Managed / company machine',
+        detail:
+          'IT application-control policy blocks external EXEs (e.g. policy popup on whisper-server.exe) — uses the in-process engine, no child process, no popups.',
+        envKind: 'managed' as const,
+      },
+    ],
+    { placeHolder: 'What kind of machine is this?', ignoreFocusOut: true },
+  );
+  if (!envKind) return; // cancelled → don't change state
+  if (envKind.envKind === 'managed') return runManagedSetup(deps);
+
   // ② Tier recommendation (F5.1, show — don't auto-switch)
   const totalGb = Math.round(os.totalmem() / 1e9);
   const recommended = recommendTier(os.totalmem());
@@ -90,6 +112,41 @@ export async function runSetupWizard(deps: WizardDeps): Promise<void> {
   await setState(context, 'completed');
   void vscode.window.showInformationMessage(
     `VoiceFlow is ready! ${lmMsg}. Now focus an editor and press Ctrl+Alt+L to try dictating a sentence.`,
+  );
+}
+
+/**
+ * 受管机分支(v5-① 产品主路径):写 mode=inprocess(auto 从不 spawn server,零弹窗由
+ * 设置保证)→ 确保 ONNX 模型(offline VSIX 内置则零下载)→ completed。
+ */
+async function runManagedSetup(deps: WizardDeps): Promise<void> {
+  const { context, modelManager, log } = deps;
+  const cfg = vscode.workspace.getConfiguration('voiceflow');
+  const tier = cfg.get<InprocessTier>('inprocessModel', 'small-q8');
+  try {
+    await modelManager.ensureInprocessModel(tier); // bundled(offline VSIX)命中则即时返回
+  } catch (err) {
+    if (err instanceof DownloadError && err.code === 'cancelled') {
+      void vscode.window.showInformationMessage(
+        'VoiceFlow: download cancelled (partial download kept; resumable). You can run "VoiceFlow: Setup Wizard" again later.',
+      );
+    } else {
+      void vscode.window.showErrorMessage(`VoiceFlow: in-process model setup failed — ${String(err)}`);
+    }
+    return; // don't mark completed, don't change config
+  }
+  // 模型就绪才写配置(与 .bin 分支"下载成功才写回"同规则)
+  await cfg.update('whisper.mode', 'inprocess', vscode.ConfigurationTarget.Global);
+  await cfg.update('inprocessModel', tier, vscode.ConfigurationTarget.Global);
+  log(`[wizard] managed machine setup: whisper.mode=inprocess, model=${tier}`);
+
+  const lm = await createVscodeLmProvider(log);
+  const lmMsg = lm
+    ? `AI cleanup available (${lm.name}) — will enhance automatically`
+    : 'No AI model detected → using local rules cleanup (text stays on your machine). For AI cleanup, install Copilot or select claude-cli / codex-cli in settings';
+  await setState(context, 'completed');
+  void vscode.window.showInformationMessage(
+    `VoiceFlow is ready (in-process engine, no policy popups)! ${lmMsg}. Now focus an editor and press Ctrl+Alt+L to try dictating a sentence.`,
   );
 }
 

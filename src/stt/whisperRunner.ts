@@ -14,12 +14,22 @@
  *   计数归零且 server ready 才武装;lease 获取即清计时器(在途请求不被 idle kill)
  * - transient 失效策略(v11-④):连接层错误(reset/refused/进程退出)先失效 server 代际再抛
  *   transient(重试自然重新 prepare);HTTP 5xx 保留 server 直接 transient
+ *
+ * inproc-s2 改造(plan v7 §3.1/§4-s2):
+ * - implements WhisperEngine(./engine);dispose/updateConfig 异步签名(v6-③/v7-②,
+ *   server/cli 效果同步、即时 resolve)
+ * - startServer 补 proc.on('error')(修未处理 error 事件可崩宿主)+ 策略拦截判据
+ *   (s1-d B' 定案):spawn error UNKNOWN/EPERM 副判据 + 静默无输出主判据
+ *   (零 stderr + 退出任意码含 0 / 无输出 watchdog + 非自杀)→ EngineBlockedError
+ * - CLI spawn error 同款映射(v4-⑤);CLI 不做静默 exit-0 判据——`-np` 下合法空转写
+ *   与静默不可区分(worklog inproc-s2)
  */
 import { ChildProcess, spawn } from 'node:child_process';
 import { openAsBlob } from 'node:fs';
-import { access } from 'node:fs/promises';
+import { access, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
+import { EngineBlockedError, type WhisperEngine } from './engine';
 
 export type WhisperMode = 'server' | 'cli';
 export type WhisperLanguage = 'zh' | 'en' | 'auto';
@@ -41,9 +51,19 @@ export interface WhisperConfig {
   modelPath: string;
   language: WhisperLanguage;
   initialPrompt: string;
-  mode: WhisperMode | 'auto';
+  /** 'inprocess' 由 EngineManager 消化,不会到达 runner 的解析(防御性按 auto 处理)。 */
+  mode: WhisperMode | 'auto' | 'inprocess';
   /** F2.4:空闲卸载(分钟,0=常驻)。仅 server 模式有意义。 */
   idleUnloadMinutes: number;
+  /** 内部(测试注入):静默拦截 watchdog 毫秒数,缺省 10s(s1-d 判据 ②)。非用户配置。 */
+  silentBlockTimeoutMs?: number;
+  /** inprocess 引擎参数(s4;server/cli 忽略)。localModelPath/modelId 为派生值(v4-⑧/v6-②)。 */
+  inprocess?: {
+    localModelPath: string;
+    modelId: string;
+    /** §3.7 硬上限(分钟,0=真常驻);到点尊重 lease/inflight(v6-④ pending-unload)。 */
+    maxResidentMinutes: number;
+  };
   log: (line: string) => void;
   onColdStart?: (loading: boolean) => void;
 }
@@ -57,16 +77,30 @@ export interface TranscribeOptions {
 
 export interface TranscribeResult {
   text: string;
-  /** server verbose_json 的 detected_language(如 "chinese"/"english";CLI 形态无)。P2b 语言锁定用。 */
+  /**
+   * 检测语言:server = verbose_json 的 detected_language("chinese"/"english");
+   * inprocess = 输出语言 token 码("zh"/"en")。锁定映射走 normalizeDetectedLanguage(v4-⑦)。
+   */
   detectedLanguage?: string;
   coldStartMs?: number;
   transcribeMs: number;
-  mode: WhisperMode;
+  mode: WhisperMode | 'inprocess';
 }
 
 const SERVER_BINARIES = ['whisper-server.exe', 'server.exe'];
 const CLI_BINARIES = ['whisper-cli.exe', 'main.exe'];
 const SERVER_READY_TIMEOUT_MS = 120_000; // 大模型冷加载可能很慢
+/**
+ * 静默拦截 watchdog(s1-d B' 判据 ②):正常 whisper-server 数百 ms 内必有 stderr 加载日志;
+ * 被策略拦的进程全程零输出且退出时机取决于用户点弹框 → 10s 无输出即判 blocked,
+ * 不空转到 120s 健康超时。
+ */
+const SILENT_BLOCK_TIMEOUT_MS = 10_000;
+
+/** s1-d 判据 ①(SAC 形态副判据):spawn error 的策略特征 errno。 */
+function isPolicyErrno(code: string | undefined): boolean {
+  return code === 'UNKNOWN' || code === 'EPERM';
+}
 
 export const DEFAULT_INITIAL_PROMPT = '以下是简体中文普通话的句子,使用标点符号。';
 
@@ -93,6 +127,17 @@ export async function resolveWhisperMode(
 ): Promise<WhisperMode> {
   if (mode !== 'auto') return mode;
   return (await findBinary(binaryDir, SERVER_BINARIES)) !== undefined ? 'server' : 'cli';
+}
+
+/**
+ * server bin 标识(v4-④ blocked 记忆的失效判据):路径+大小+mtime。
+ * bin 缺失 → undefined(auto 走 cli,与 resolveWhisperMode 一致)。
+ */
+export async function serverBinaryStamp(binaryDir: string): Promise<string | undefined> {
+  const bin = await findBinary(binaryDir, SERVER_BINARIES);
+  if (bin === undefined) return undefined;
+  const s = await stat(bin);
+  return `${bin}|${s.size}|${Math.round(s.mtimeMs)}`;
 }
 
 async function freePort(): Promise<number> {
@@ -169,7 +214,7 @@ const DEFAULT_RUNTIME: WhisperRuntime = {
   openWavAsBlob: (p) => openAsBlob(p),
 };
 
-export class WhisperRunner {
+export class WhisperRunner implements WhisperEngine {
   private server: { proc: ChildProcess; port: number } | undefined; // 仅 ready 后赋值(v7-③)
   private startingProc: ChildProcess | undefined; // 启动中的进程(dispose 需能杀到)
   private serverReady: { key: string; promise: Promise<ServerHandle> } | undefined;
@@ -185,7 +230,8 @@ export class WhisperRunner {
     return `${this.cfg.modelPath}|${this.cfg.mode}|${this.cfg.binaryDir}`;
   }
 
-  updateConfig(cfg: WhisperConfig): void {
+  /** v7-②:异步签名(调用方 await);server/cli 的释放是即时的,效果保持同步。 */
+  async updateConfig(cfg: WhisperConfig): Promise<void> {
     // v9-⑥:server 身份 = {modelPath, mode, binaryDir},任一变更即失效旧代际
     const identityChanged =
       cfg.modelPath !== this.cfg.modelPath ||
@@ -234,7 +280,10 @@ export class WhisperRunner {
     const releaseLease = this.acquireLease(); // 在途请求不被 idle kill(v9-②)
     try {
       throwIfAborted(opts.signal);
-      const mode = await resolveWhisperMode(this.cfg.binaryDir, this.cfg.mode);
+      const mode = await resolveWhisperMode(
+        this.cfg.binaryDir,
+        this.cfg.mode === 'inprocess' ? 'auto' : this.cfg.mode,
+      );
       return mode === 'server'
         ? await this.transcribeServer(wavPath, opts)
         : await this.transcribeCli(wavPath, opts);
@@ -263,7 +312,20 @@ export class WhisperRunner {
       { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
     );
     this.startingProc = proc;
-    proc.stderr?.on('data', (d: Buffer) => this.cfg.log(`[whisper-server] ${d.toString().trimEnd()}`));
+    let sawStderr = false; // s1-d 判据 ②:正常 server 数百 ms 内必有 stderr 加载日志
+    proc.stderr?.on('data', (d: Buffer) => {
+      sawStderr = true;
+      this.cfg.log(`[whisper-server] ${d.toString().trimEnd()}`);
+    });
+    // s2 前置修复:无此监听时 spawn error 是未处理 error 事件(可崩宿主),
+    // 且健康探测的 exitCode 兜不住(spawn error 不设 exitCode)
+    let spawnError: Error | undefined;
+    proc.on('error', (e: NodeJS.ErrnoException) => {
+      spawnError = isPolicyErrno(e.code)
+        ? new EngineBlockedError(`whisper-server 被系统应用控制策略拦截(${e.code}):${bin}`)
+        : new WhisperError('permanent', `whisper-server 启动失败:${e.message}(${bin})`);
+      if (this.startingProc === proc) this.startingProc = undefined;
+    });
     proc.on('exit', (code) => {
       this.cfg.log(`[whisper] server exited (code ${code})`);
       if (this.server?.proc === proc) this.server = undefined;
@@ -273,9 +335,25 @@ export class WhisperRunner {
     try {
       // 健康探测:模型加载完成前连接会被拒
       const deadline = Date.now() + SERVER_READY_TIMEOUT_MS;
+      const silentDeadline = Date.now() + (this.cfg.silentBlockTimeoutMs ?? SILENT_BLOCK_TIMEOUT_MS);
       for (;;) {
+        if (spawnError) throw spawnError;
         if (proc.exitCode !== null) {
+          // s1-d B' 主判据:零 stderr 退出(任意码,公司机实测 code 0)且非自杀
+          // (dispose/代际失效 kill 的进程 killed=true,维持 transient,零回归)
+          if (!sawStderr && !proc.killed) {
+            throw new EngineBlockedError(
+              `whisper-server 无输出即退出(code ${proc.exitCode}),疑似被应用控制策略拦截:${bin}`,
+            );
+          }
           throw new WhisperError('transient', `whisper-server 启动即退出(code ${proc.exitCode})`);
+        }
+        if (!sawStderr && Date.now() > silentDeadline) {
+          // s1-d B' 弹框挂起分支:退出时机取决于用户点弹框 → watchdog 兜底,不空转到 120s
+          proc.kill();
+          throw new EngineBlockedError(
+            `whisper-server 启动后持续无输出(疑似被策略弹框挂起):${bin}`,
+          );
         }
         if (Date.now() > deadline) {
           proc.kill();
@@ -367,17 +445,24 @@ export class WhisperRunner {
     });
     const t0 = Date.now();
     const text = await new Promise<string>((resolve, reject) => {
-      const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      const proc = this.runtime.spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       let stdout = '';
       let stderr = '';
-      proc.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
-      proc.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
+      proc.stdout?.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
+      proc.stderr?.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
       const onAbort = (): void => {
         proc.kill();
         reject(new WhisperError('cancelled', 'transcription aborted'));
       };
       opts.signal?.addEventListener('abort', onAbort, { once: true });
-      proc.on('error', (err) => reject(new WhisperError('permanent', `whisper-cli 启动失败:${err.message}`)));
+      // v4-⑤:与 server 对称的策略特征映射;CLI 不做静默 exit-0 判据(-np 下合法空转写不可区分)
+      proc.on('error', (err: NodeJS.ErrnoException) =>
+        reject(
+          isPolicyErrno(err.code)
+            ? new EngineBlockedError(`whisper-cli 被系统应用控制策略拦截(${err.code}):${bin}`)
+            : new WhisperError('permanent', `whisper-cli 启动失败:${err.message}`),
+        ),
+      );
       proc.on('close', (code) => {
         opts.signal?.removeEventListener('abort', onAbort);
         if (code === 0) resolve(stdout.trim());
@@ -420,8 +505,11 @@ export class WhisperRunner {
     this.clearIdleTimer();
   }
 
-  /** Reload Window gate:kill 子进程(含启动中的),无残留。 */
-  dispose(): void {
+  /**
+   * Reload Window gate:kill 子进程(含启动中的),无残留。
+   * v6-③:异步签名(inprocess 引擎需等在途推理 settle);server/cli kill 即时,同步生效。
+   */
+  async dispose(): Promise<void> {
     this.unloadServer('dispose');
   }
 }

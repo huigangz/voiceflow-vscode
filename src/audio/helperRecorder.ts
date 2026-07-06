@@ -98,8 +98,12 @@ export class HelperRecorder implements Recorder {
             : `helper 启动失败:${err.message}(路径 ${this.exePath})`,
         );
         this.clearWatchdog();
+        // inproc-s3 修复:settle() 自身置 settled → 原 `if (settled)` 恒真,启动失败会
+        // reject+onError 双重上报(产品双弹错误;无麦环境测试 onError 抛错成 uncaught)。
+        // onError 只该在"start 已成功、错误发生在录音中途"时走。
+        const wasSettled = settled;
         settle(() => reject(rerr));
-        if (settled) events.onError(rerr);
+        if (wasSettled) events.onError(rerr);
       });
 
       proc.stderr!.setEncoding('utf8').on('data', (d: string) => {
@@ -135,8 +139,9 @@ export class HelperRecorder implements Recorder {
         if (this.stopping) return; // 正常停止 / watchdog 已处理
         const err = mapExitCode(code, stderrTail.trim());
         this.log(`[recorder] helper exited unexpectedly: ${err.code} — ${err.message}`);
+        const wasSettled = settled; // 同上:启动失败只 reject,不双报 onError
         settle(() => reject(err));
-        if (settled) events.onError(err); // 录音中途设备失败 → 上层丢弃数据回 idle(S1 gate)
+        if (wasSettled) events.onError(err); // 录音中途设备失败 → 上层丢弃数据回 idle(S1 gate)
       });
     });
   }

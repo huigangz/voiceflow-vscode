@@ -2,7 +2,7 @@
   "name": "voiceflow-vscode",
   "displayName": "VoiceFlow",
   "description": "Wispr Flow-style local voice dictation: press a key and speak, transcribe locally with whisper, clean up, and insert into the editor or terminal. Audio never leaves your machine.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "publisher": "voiceflow-preview",
   "license": "MIT",
@@ -122,7 +122,15 @@
         "voiceflow.model.sourceUrl": {
           "type": "string",
           "default": "",
-          "description": "Custom model source for restricted networks. An https base URL (e.g. https://intranet/whisper-models) is used before HuggingFace — the model file name is appended. A local/UNC folder (e.g. \\\\server\\share\\models or D:\\models) is copied from directly. Leave empty to use HuggingFace + hf-mirror."
+          "description": "Custom model source for restricted networks. An https base URL (e.g. https://intranet/whisper-models) is used before HuggingFace — the model file name is appended. A local/UNC folder (e.g. \\\\server\\share\\models or D:\\models) is copied from directly. Leave empty to use HuggingFace + hf-mirror. Also used by inprocess ONNX downloads (HuggingFace repo layout expected)."
+        },
+        "voiceflow.inprocessModel": {
+          "type": "string",
+          "enum": [
+            "small-q8"
+          ],
+          "default": "small-q8",
+          "description": "In-process (ONNX) whisper model tier, used on managed/company machines where the whisper server binary is blocked by application-control policy. small-q8 (~252MB) matches whisper.cpp small quality."
         },
         "voiceflow.output.mode": {
           "type": "string",
@@ -191,10 +199,16 @@
           "enum": [
             "auto",
             "server",
-            "cli"
+            "cli",
+            "inprocess"
           ],
           "default": "auto",
-          "description": "whisper run mode. auto = use server if the server binary exists, otherwise CLI."
+          "description": "whisper run mode. auto = use server if the server binary exists (falls back to in-process transcription if blocked by application-control policy), otherwise CLI. inprocess = in-process ONNX transcription, recommended for managed/company machines (no child process, no policy popups)."
+        },
+        "voiceflow.inprocess.maxResidentMinutes": {
+          "type": "number",
+          "default": 30,
+          "description": "In-process engine: unload the model this many minutes after load regardless of idle setting (memory protection; the in-process model lives inside the extension host). 0 = keep resident. Never unloads mid-session or mid-inference."
         },
         "voiceflow.whisper.idleUnload": {
           "type": "number",
@@ -244,7 +258,7 @@
     "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
     "package": "vsce package --target win32-x64",
     "stage-model": "node scripts/stage-bundled-model.mjs",
-    "package:bundled": "node scripts/stage-bundled-model.mjs && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.2.1-offline.vsix"
+    "package:bundled": "node scripts/stage-bundled-model.mjs && node scripts/stage-bundled-model.mjs --onnx && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.3.0-offline.vsix"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
@@ -256,8 +270,12 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
+    "@huggingface/transformers": "3.8.1",
     "@picovoice/pvrecorder-node": "1.2.9",
     "onnxruntime-node": "^1.27.0",
     "opencc-js": "^1.4.0"
+  },
+  "overrides": {
+    "onnxruntime-node": "$onnxruntime-node"
   }
 }

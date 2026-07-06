@@ -16,11 +16,16 @@ import { Recorder, RecorderError } from './audio/recorder';
 import { ModelManager, ModelTier } from './stt/modelManager';
 import {
   DEFAULT_INITIAL_PROMPT,
+  WhisperConfig,
   WhisperError,
   WhisperMode,
   WhisperRunner,
-  resolveWhisperMode,
+  serverBinaryStamp,
 } from './stt/whisperRunner';
+import { BlockedMemory, EngineManager, resolveEngineMode } from './stt/engineManager';
+import { InprocessEngine } from './stt/inprocessEngine';
+import { normalizeDetectedLanguage } from './stt/engine';
+import { InprocessTier } from './stt/onnxModels';
 import { FocusHint, InsertTarget, captureTarget, dispatchInsert } from './insert/dispatcher';
 import { SegmentInserter } from './insert/segmentInserter';
 import { SegmentPipeline } from './segment/pipeline';
@@ -37,7 +42,7 @@ let session: Session;
 let recording: RecordingController | undefined;
 let extContext: vscode.ExtensionContext;
 let modelManager: ModelManager;
-let whisper: WhisperRunner | undefined;
+let whisper: EngineManager | undefined;
 let insertTarget: InsertTarget = { kind: 'none' };
 /** 会话级转写取消(v12-①:runner 无实例级 cancel,取消所有权归调用方)。 */
 let sttAbort: AbortController | undefined;
@@ -111,7 +116,7 @@ export function activate(context: vscode.ExtensionContext): void {
           segmented.releaseLease?.();
           segmented = undefined;
         }
-        whisper?.dispose();
+        void whisper?.dispose(); // v6-③ 异步签名;server/cli kill 同步生效
       },
     },
   );
@@ -120,26 +125,74 @@ export function activate(context: vscode.ExtensionContext): void {
   void maybePromptSetup({ context, modelManager, log });
 }
 
-/** 懒构建/更新 WhisperRunner(配置变更时热更新;模型换档触发 server 重载)。 */
-async function getWhisper(): Promise<WhisperRunner> {
+/** blocked 记忆(v4-④):globalState 持久化,跨 Reload 不再向被拦 exe 发 spawn(每次探测必弹框,s1-d)。 */
+const BLOCKED_MEMORY_KEY = 'voiceflow.serverBlockedByPolicy';
+function blockedMemory(): BlockedMemory {
+  return {
+    get: () => extContext.globalState.get(BLOCKED_MEMORY_KEY),
+    set: (r) => void extContext.globalState.update(BLOCKED_MEMORY_KEY, r),
+    clear: () => void extContext.globalState.update(BLOCKED_MEMORY_KEY, undefined),
+  };
+}
+
+function whisperBinaryDir(cfg: vscode.WorkspaceConfiguration): string {
+  return (
+    cfg.get<string>('whisper.binaryDir', '') ||
+    vscode.Uri.joinPath(extContext.extensionUri, 'bin').fsPath
+  );
+}
+
+/** 懒构建/更新 EngineManager(inproc-s4;配置变更时热更新;模型换档触发引擎重载)。 */
+async function getWhisper(): Promise<EngineManager> {
   const cfg = vscode.workspace.getConfiguration('voiceflow');
   const tier = cfg.get<ModelTier>('model', 'small');
-  const modelUri = await modelManager.ensureModel(tier); // 未下载则带进度下载(F2.1 懒启动)
-  const binaryDir =
-    cfg.get<string>('whisper.binaryDir', '') ||
-    vscode.Uri.joinPath(extContext.extensionUri, 'bin').fsPath;
-  const runnerCfg = {
+  const binaryDir = whisperBinaryDir(cfg);
+  const mode = cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto');
+  const memory = blockedMemory();
+  // 受管机路径(mode=inprocess / blocked 记忆生效)不确保 .bin —— 下载 488MB 的 .bin 毫无意义
+  const engineMode = await resolveEngineMode({
+    mode,
     binaryDir,
-    modelPath: modelUri.fsPath,
+    serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
+    memory,
+  });
+  const modelUri = engineMode === 'inprocess' ? undefined : await modelManager.ensureModel(tier);
+  const runnerCfg: WhisperConfig = {
+    binaryDir,
+    modelPath: modelUri?.fsPath ?? '',
     language: cfg.get<'zh' | 'en' | 'auto'>('language', 'auto'),
     initialPrompt: DEFAULT_INITIAL_PROMPT,
-    mode: cfg.get<WhisperMode | 'auto'>('whisper.mode', 'auto'),
+    mode,
     idleUnloadMinutes: cfg.get<number>('whisper.idleUnload', 10),
+    // localModelPath/modelId 是派生值,由 manager 在激活 inprocess 时经 ensure/ready 填入(v6-②)
+    inprocess: {
+      localModelPath: '',
+      modelId: '',
+      maxResidentMinutes: cfg.get<number>('inprocess.maxResidentMinutes', 30),
+    },
     log,
     onColdStart: (loading: boolean) => statusBar.setModelLoading(loading), // F2.1
   };
-  if (!whisper) whisper = new WhisperRunner(runnerCfg);
-  else whisper.updateConfig(runnerCfg);
+  if (!whisper) {
+    whisper = new EngineManager(runnerCfg, {
+      runner: new WhisperRunner(runnerCfg),
+      createInprocess: (c) => new InprocessEngine(c),
+      ensureInprocessModel: (t) => modelManager.ensureInprocessModel(t),
+      isInprocessReady: (t) => modelManager.resolveExistingInprocess(t),
+      serverBinStamp: (d) => serverBinaryStamp(d),
+      memory,
+      notifyFallback: () =>
+        void vscode.window.showInformationMessage(
+          'VoiceFlow: whisper server 被系统应用控制策略拦截,已自动切换到进程内转写(inprocess)。' +
+            '建议把 "voiceflow.whisper.mode" 固定为 "inprocess" 以跳过探测(或重跑 Setup Wizard)。',
+        ),
+      inprocessTier: () =>
+        vscode.workspace.getConfiguration('voiceflow').get<InprocessTier>('inprocessModel', 'small-q8'),
+      log,
+    });
+  } else {
+    await whisper.updateConfig(runnerCfg); // v7-②:等旧代际释放,防新旧引擎并存
+  }
   return whisper;
 }
 
@@ -313,15 +366,16 @@ async function startSegmentedSession(
     void vscode.window.showErrorMessage(`VoiceFlow: ${valid.error}`);
     return;
   }
-  // ② server 形态准入(评审 v8-⑤:CLI 显式拒绝不静默降级;v10-③/v11-⑤:快速判定不碰模型)
-  const binaryDir =
-    cfg.get<string>('whisper.binaryDir', '') ||
-    vscode.Uri.joinPath(extContext.extensionUri, 'bin').fsPath;
-  const whisperMode = await resolveWhisperMode(
+  // ② 形态准入(评审 v8-⑤:CLI 显式拒绝不静默降级;v10-③/v11-⑤:快速判定不碰模型;
+  //    inproc-s4/§3.5:准入从"server"放宽为"server 或 inprocess"——两者常驻、无每段冷加载)
+  const binaryDir = whisperBinaryDir(cfg);
+  const engineMode = await resolveEngineMode({
+    mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
     binaryDir,
-    cfg.get<WhisperMode | 'auto'>('whisper.mode', 'auto'),
-  );
-  if (whisperMode === 'cli') {
+    serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
+    memory: blockedMemory(),
+  });
+  if (engineMode === 'cli') {
     statusBar.showError('Segmented requires whisper server');
     void vscode.window.showErrorMessage(
       'VoiceFlow: segmented mode requires the whisper server binary (per-segment CLI cold-load latency is unacceptable). ' +
@@ -376,8 +430,8 @@ async function startSegmentedSession(
       );
       firstSegmentDone = true;
       if (baseLanguage === 'auto' && lockedLanguage === undefined && s.speechMs >= MIN_LOCK_SPEECH_MS) {
-        const mapped =
-          r.detectedLanguage === 'chinese' ? 'zh' : r.detectedLanguage === 'english' ? 'en' : undefined;
+        // v4-⑦ 唯一映射点:server('chinese'/'english')与 inprocess('zh'/'en')双词汇归一
+        const mapped = normalizeDetectedLanguage(r.detectedLanguage);
         if (mapped) {
           lockedLanguage = mapped;
           log(`[dictation] session language locked: ${mapped} (segment #${s.index}, speech ${(s.speechMs / 1000).toFixed(1)}s)`);
@@ -705,7 +759,7 @@ async function showRecorderError(err: RecorderError): Promise<void> {
   else if (action === 'View Logs') output.show();
 }
 
-export function deactivate(): void {
+export function deactivate(): Promise<void> | undefined {
   recording?.dispose();
   recording = undefined;
   if (segmented) {
@@ -714,6 +768,9 @@ export function deactivate(): void {
     segmented.releaseLease?.();
     segmented = undefined;
   }
-  whisper?.dispose(); // Reload Window gate:kill whisper server,无残留进程
+  // Reload Window gate:kill whisper server,无残留进程。
+  // v6-③:返回 dispose promise(inprocess 引擎需等在途推理 settle;server/cli 即时)
+  const disposed = whisper?.dispose();
   whisper = undefined;
+  return disposed;
 }
