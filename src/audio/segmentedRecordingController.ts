@@ -14,7 +14,7 @@ import * as vscode from 'vscode';
 import { PcmChunk, Recorder, RecorderError, SAMPLE_RATE } from './recorder';
 import { RecordingPolicy, RecordingPolicyConfig } from './recordingPolicy';
 import { encodeWavPcm16 } from './wav';
-import { SealedSegment, SegmentAccumulator } from '../segment/segmentation';
+import { SealedSegment, SegmentAccumulator, SegmentAccumulatorOptions } from '../segment/segmentation';
 
 export interface SegmentFile {
   wavUri: vscode.Uri;
@@ -52,9 +52,10 @@ export class SegmentedRecordingController {
     segmentPauseMs: number,
     private readonly storageUri: vscode.Uri,
     private readonly log: (line: string) => void,
+    accOpts: SegmentAccumulatorOptions = {},
   ) {
     this.policy = new RecordingPolicy(policyCfg);
-    this.acc = new SegmentAccumulator(segmentPauseMs, (seg) => this.enqueueWrite(seg));
+    this.acc = new SegmentAccumulator(segmentPauseMs, (seg) => this.enqueueWrite(seg), accOpts);
   }
 
   async start(): Promise<void> {

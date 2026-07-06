@@ -108,6 +108,44 @@ describe('短段挂起并入(评审 ③ / v4-④)', () => {
   });
 });
 
+describe('强制切分上限(P2c gate 实测修复:连续内容无停顿)', () => {
+  it('连续语音 65s、无停顿 → 按 20s 上限强制切出多段(不再单段膨胀)', () => {
+    const { segs, onSeal } = collect();
+    const acc = new SegmentAccumulator(800, onSeal, { maxSegmentMs: 20_000 });
+    feed(acc, [['s', 65_000]]);
+    acc.finalize();
+    expect(segs.length).toBeGreaterThanOrEqual(3); // 20+20+20+尾
+    for (const s of segs.slice(0, 3)) {
+      expect(s.endMs - s.startMs).toBeLessThanOrEqual(20_000 + 32);
+      expect(s.hasSpeech).toBe(true);
+    }
+  });
+
+  it('纯静音满上限 → 直接丢弃不积存(v8-② 原则;GapFiller 静音流防内存膨胀)', () => {
+    const { segs, onSeal } = collect();
+    const acc = new SegmentAccumulator(800, onSeal, { maxSegmentMs: 20_000 });
+    feed(acc, [['_', 70_000]]); // 70s 纯静音
+    acc.finalize();
+    expect(segs).toHaveLength(0); // 无段产出,也无 pending 积存
+  });
+
+  it('上限=0(默认关闭)行为与旧版完全一致', () => {
+    const { segs, onSeal } = collect();
+    const acc = new SegmentAccumulator(1500, onSeal);
+    feed(acc, [['s', 30_000]]);
+    acc.finalize();
+    expect(segs).toHaveLength(1); // 不强制切
+  });
+
+  it('停顿切分优先于强制切分(有停顿的内容不受上限影响)', () => {
+    const { segs, onSeal } = collect();
+    const acc = new SegmentAccumulator(800, onSeal, { maxSegmentMs: 20_000 });
+    feed(acc, [['s', 5000], ['_', 1000], ['s', 5000], ['_', 1000]]);
+    acc.finalize();
+    expect(segs).toHaveLength(2); // 两次停顿切,均远小于 20s
+  });
+});
+
 describe('尾段与丢弃(评审 v8-②)', () => {
   it('纯静音尾段且无 pending → 不提交(无语音≠丢内容)', () => {
     const { segs, onSeal } = collect();

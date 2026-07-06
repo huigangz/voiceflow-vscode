@@ -10,6 +10,8 @@ import { HelperRecorder } from './audio/helperRecorder';
 import { AddonRecorder } from './audio/addonRecorder';
 import { RecordingController, cleanTmpWavs } from './audio/recordingController';
 import { SegmentedRecordingController } from './audio/segmentedRecordingController';
+import { LoopbackRecorder, loadVoiceflowAudio } from './audio/loopbackRecorder';
+import { SileroVad } from './audio/sileroVad';
 import { Recorder, RecorderError } from './audio/recorder';
 import { ModelManager, ModelTier } from './stt/modelManager';
 import {
@@ -92,6 +94,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('voiceflow.toggleDictation', toggleDictation),
     vscode.commands.registerCommand('voiceflow.cancelSession', cancelSession),
     vscode.commands.registerCommand('voiceflow.showLogs', () => output.show()),
+    vscode.commands.registerCommand('voiceflow.dictateSystemAudio', dictateSystemAudio),
     vscode.commands.registerCommand('voiceflow.downloadModel', () => modelManager.pickAndDownload()),
     vscode.commands.registerCommand('voiceflow.importModel', () => modelManager.pickAndImport()),
     vscode.commands.registerCommand('voiceflow.openSetupWizard', () =>
@@ -264,14 +267,46 @@ async function startBatchSession(
 
 // ---------- P2b:segmented 会话编排 ----------
 
+/**
+ * P2c:系统音频听写(评审 v5-⑤ 隐私 UX:显式命令启动、首次模态确认、状态栏全程明示)。
+ * 强制 segmented(长流只能分段出字);D6:独立会话上限 + 禁用静音自动停
+ * (系统音频常有长静默——会议冷场/视频暂停,自动停会误伤;靠显式停止/上限)。
+ */
+async function dictateSystemAudio(): Promise<void> {
+  if (session.active) {
+    vscode.window.setStatusBarMessage('$(warning) VoiceFlow: a session is already active', 3000);
+    return;
+  }
+  const noticeKey = 'voiceflow.systemAudioNoticeShown';
+  if (!extContext.globalState.get<boolean>(noticeKey)) {
+    const choice = await vscode.window.showInformationMessage(
+      'VoiceFlow will capture ALL sound your computer plays (from every app), transcribe it locally, ' +
+        'and insert the text incrementally. Audio never leaves your machine and temporary files are ' +
+        'deleted right after transcription. Continue?',
+      { modal: true },
+      'Start',
+    );
+    if (choice !== 'Start') return;
+    await extContext.globalState.update(noticeKey, true);
+  }
+  const cfg = vscode.workspace.getConfiguration('voiceflow');
+  return startSegmentedSession(cfg, undefined, { systemAudio: true });
+}
+
 async function startSegmentedSession(
   cfg: vscode.WorkspaceConfiguration,
   focusHint: FocusHint,
+  opts: { systemAudio?: boolean } = {},
 ): Promise<void> {
-  // ① 配置校验(评审 v5-②/v7-⑥:非法值拒绝进入,不静默 clamp)
+  // ① 配置校验(评审 v5-②/v7-⑥:非法值拒绝进入,不静默 clamp);
+  //    系统音频禁用静音自动停 → 无上界约束(评审 v5-② 的 autoStop=0 分支)
+  const autoStopSilenceS = opts.systemAudio ? 0 : cfg.get<number>('recording.autoStopSilence', 3);
+  // 系统音频独立切段停顿(默认 0.8s):专业播音句间停顿远短于口述,1.5s 会整场切不出段
   const valid = validateSegmentedConfig({
-    segmentPauseS: cfg.get('output.segmentPause', 1.5),
-    autoStopSilenceS: cfg.get<number>('recording.autoStopSilence', 3),
+    segmentPauseS: opts.systemAudio
+      ? cfg.get('systemAudio.segmentPause', 0.8)
+      : cfg.get('output.segmentPause', 1.5),
+    autoStopSilenceS,
   });
   if (!valid.ok) {
     statusBar.showError('Segmented config error');
@@ -377,18 +412,27 @@ async function startSegmentedSession(
   });
   seg.pipeline = pipeline;
 
+  // D6:系统音频独立会话上限(默认 30min;分段管线段完即插即删,长会话内存平稳)
+  const maxDurationMs =
+    (opts.systemAudio
+      ? cfg.get<number>('systemAudio.maxDuration', 1800)
+      : cfg.get<number>('recording.maxDuration', 120)) * 1000;
+
   session.dispatch('start');
   try {
-    seg.controller = await startWithRecorderFallback(cfg, (r) => {
+    const buildSegController = (r: Recorder): SegmentedRecordingController => {
       const c = new SegmentedRecordingController(
         r,
         {
-          maxDurationMs: cfg.get<number>('recording.maxDuration', 120) * 1000,
-          autoStopSilenceMs: cfg.get<number>('recording.autoStopSilence', 3) * 1000,
+          maxDurationMs,
+          autoStopSilenceMs: autoStopSilenceS * 1000,
         },
         valid.segmentPauseMs,
         extContext.globalStorageUri,
         log,
+        // 强制切分 20s(P2c gate 实测:连续解说无停顿 → 段膨胀触发 backlog 停采;
+        // 对口述同样防长独白撑爆;whisper 30s 窗内,20s 段 warm ~6s 管线稳跟)
+        { maxSegmentMs: 20_000 },
       );
       c.onSegment = (s) => {
         seg.pending++;
@@ -421,9 +465,29 @@ async function startSegmentedSession(
         void showRecorderError(err);
       };
       return c;
-    });
+    };
+
+    if (opts.systemAudio) {
+      // P2c:LoopbackRecorder(自研 addon + Silero VAD)。无 helper 回退——系统音频
+      // 没有备用采集路径,失败直接呈现(module-unavailable/init-failed 文案指引)
+      const addonPath = vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-audio.node').fsPath;
+      const modelPath = vscode.Uri.joinPath(
+        extContext.extensionUri, 'media', 'vad', 'silero_vad_v5.onnx',
+      ).fsPath;
+      const recorder = new LoopbackRecorder(
+        log,
+        loadVoiceflowAudio(addonPath),
+        () => SileroVad.create(modelPath),
+      );
+      const c = buildSegController(recorder);
+      await c.start();
+      log('[dictation] recording via loopback (system audio)… (Ctrl+Alt+L to stop, Esc to cancel)');
+      seg.controller = c;
+    } else {
+      seg.controller = await startWithRecorderFallback(cfg, buildSegController);
+    }
     segmented = seg;
-    statusBar.recordingLive();
+    statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
   } catch (err) {
     pipeline.cancel();
     seg.releaseLease?.();

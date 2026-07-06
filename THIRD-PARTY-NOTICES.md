@@ -11,6 +11,10 @@ Third-party components used at build/runtime and their licenses:
 | Whisper ggml models (OpenAI Whisper weights) | Transcription models (downloaded on first run) | MIT |
 | [opencc-js](https://github.com/nk2028/opencc-js) (OpenCC dictionaries) | Traditional→Simplified Chinese conversion | MIT + Apache-2.0 |
 | [@picovoice/pvrecorder-node](https://github.com/Picovoice/pvrecorder) 1.2.9 | In-process microphone capture (`pv_recorder.node`, Windows x64) | Apache-2.0 |
+| [miniaudio](https://github.com/mackron/miniaudio) 0.11.25 | System-audio (loopback) capture — compiled into our `voiceflow-audio.node` | MIT-0 (or public domain) |
+| [node-addon-api](https://github.com/nodejs/node-addon-api) | N-API C++ headers — compiled into `voiceflow-audio.node` | MIT |
+| [onnxruntime-node](https://github.com/microsoft/onnxruntime) 1.27.0 | Voice-activity-detection inference runtime (CPU; Windows x64 binaries) | MIT |
+| [Silero VAD](https://github.com/snakers4/silero-vad) v5 model (`silero_vad_v5.onnx`) | Voice activity detection for system-audio dictation | MIT |
 
 Uses the whisper.cpp **CPU (no-BLAS)** build and **does not distribute OpenBLAS** (no BSD-3-Clause obligation).
 

@@ -33,6 +33,12 @@ You can also manually place a `ggml-*.bin` in `%APPDATA%\Code\User\globalStorage
 - **Segmented dictation (opt-in)**: set `voiceflow.output.mode` to `segmented` — pause ~1.5s while speaking and the finished sentence is transcribed and inserted while you keep talking. Editor targets insert per segment; terminal targets confirm once (Send / Copy) at the end. Already-inserted text is final — Esc keeps it and discards only unfinished segments.
 - **Language auto-detection fix**: in server mode, "auto" previously fell back to the server's default (**English**) — Chinese speech could come out as an English translation. Auto is now passed explicitly and detects correctly.
 
+## System-audio dictation (experimental)
+
+Run **"VoiceFlow: Dictate from System Audio"** from the command palette to transcribe what your computer is playing (a video, a meeting, a podcast) instead of the microphone. Sessions are always segmented (sentences appear as the audio plays), voice detection uses a local Silero neural VAD (robust to background music), and the session runs up to `voiceflow.systemAudio.maxDuration` (default 30 minutes — stop anytime with `Ctrl+Alt+L` or Esc).
+
+**Privacy**: this captures **all sound your computer plays, from every app** — you get a one-time confirmation before the first session, and the status bar shows a distinct `SYS` indicator the whole time. Like microphone dictation, audio is processed entirely on your machine and temporary files are deleted immediately after transcription.
+
 ## How it behaves
 
 - The insertion target is locked **when recording starts**; if by the end the original editor was closed / the cursor position became invalid / the terminal exited, the text is copied to the clipboard with a notice.

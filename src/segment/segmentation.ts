@@ -41,16 +41,29 @@ interface Buf {
 
 const FRAME_MS = 32; // 512 samples @ 16kHz;时长按帧数推算,与 energyVad 时间戳同源
 
+export interface SegmentAccumulatorOptions {
+  /**
+   * 强制切分上限(ms,0=关闭):连续语音无停顿时段到此时长强制封口(P2c gate 实测:
+   * 快节奏解说 67s 无一次够长停顿 → 段无限膨胀触发 backlog 停采;强制切分保住逐段出字
+   * 与管线背压)。纯静音段到上限**直接丢弃**(v8-② 无语音≠内容;防 GapFiller 静音流积存)。
+   */
+  maxSegmentMs?: number;
+}
+
 export class SegmentAccumulator {
   private cur: Buf | undefined;
   private pending: Buf | undefined;
   /** 当前段内最后语音时刻(段边界检测用,段级状态)。 */
   private lastSpeechMs = -1;
+  private readonly maxSegmentMs: number;
 
   constructor(
     private readonly segmentPauseMs: number,
     private readonly onSeal: (seg: SealedSegment) => void,
-  ) {}
+    opts: SegmentAccumulatorOptions = {},
+  ) {
+    this.maxSegmentMs = opts.maxSegmentMs ?? 0;
+  }
 
   push(chunk: PcmChunk): void {
     if (!this.cur) {
@@ -68,6 +81,16 @@ export class SegmentAccumulator {
       chunk.timeMs - this.lastSpeechMs >= this.segmentPauseMs
     ) {
       this.sealCurrent();
+      return;
+    }
+    // 强制切分(P2c):连续内容不给停顿时,到上限也要出字
+    if (this.maxSegmentMs > 0 && this.cur && this.cur.endMs - this.cur.startMs >= this.maxSegmentMs) {
+      if (this.cur.speechMs > 0) {
+        this.sealCurrent();
+      } else {
+        this.cur = undefined; // 纯静音满上限:丢弃(无语音≠丢内容,v8-②;防静音流积存内存)
+        this.lastSpeechMs = -1;
+      }
     }
   }
 

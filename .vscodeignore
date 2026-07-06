@@ -19,6 +19,15 @@ node_modules/**
 !node_modules/@picovoice/pvrecorder-node/package.json
 !node_modules/@picovoice/pvrecorder-node/dist/**/*.js
 !node_modules/@picovoice/pvrecorder-node/lib/windows/amd64/pv_recorder.node
+!node_modules/onnxruntime-node/package.json
+!node_modules/onnxruntime-node/dist/*.js
+!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/onnxruntime_binding.node
+!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/onnxruntime.dll
+!node_modules/onnxruntime-common/package.json
+!node_modules/onnxruntime-common/dist/cjs/*.js
+!node_modules/onnxruntime-common/dist/cjs/package.json
+!media/vad/silero_vad_v5.onnx
+native/**
 esbuild.mjs
 tsconfig.json
 vitest.config.ts
@@ -30,3 +39,4 @@ models/**
 *.vsix
 # 评审 v7-①:普通 package 永不带模型(不再依赖"目录为空");offline 打包用 .vscodeignore-offline
 offline-model/**
+voiceflow-inprocess-stt-plan.md

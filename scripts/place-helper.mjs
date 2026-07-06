@@ -14,14 +14,18 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const src = join(root, 'prebuilt', 'voiceflow-mic.exe');
 const dstDir = join(root, 'bin');
-const dst = join(dstDir, 'voiceflow-mic.exe');
-
-if (!existsSync(src)) {
-  console.error(`[place-helper] FATAL: 缺 ${src}(用 npm run build:helper:compile 生成并 commit)`);
-  process.exit(1);
-}
 mkdirSync(dstDir, { recursive: true });
-copyFileSync(src, dst);
-console.log('[place-helper] prebuilt/voiceflow-mic.exe → bin/(固定哈希,不重编译)');
+
+// P2c:自研 voiceflow-audio.node 同一模式(固定预编译 + SHA 锁定;重编译走
+// scripts/build-audio-addon.mjs 并同步 manifest SHA)
+const PREBUILT = ['voiceflow-mic.exe', 'voiceflow-audio.node'];
+for (const name of PREBUILT) {
+  const src = join(root, 'prebuilt', name);
+  if (!existsSync(src)) {
+    console.error(`[place-helper] FATAL: 缺 ${src}(mic: build:helper:compile;audio: build-audio-addon.mjs)`);
+    process.exit(1);
+  }
+  copyFileSync(src, join(dstDir, name));
+  console.log(`[place-helper] prebuilt/${name} → bin/(固定哈希,不重编译)`);
+}

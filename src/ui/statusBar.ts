@@ -80,11 +80,18 @@ export class StatusBar implements vscode.Disposable {
         : '$(loading~spin) VoiceFlow: Finishing…';
   }
 
-  /** 麦克风就绪,开始亮红点计时(录音管线 start() resolve 后调用)。 */
-  recordingLive(): void {
+  /** P2c:采集源形态(隐私 UX 评审 v5-⑤:系统音频全程明示,图标/文案区别于麦克风)。 */
+  private flavor: 'mic' | 'system' = 'mic';
+
+  /** 采集就绪,开始亮红点计时(录音管线 start() resolve 后调用)。 */
+  recordingLive(flavor: 'mic' | 'system' = 'mic'): void {
+    this.flavor = flavor;
     this.recordingSince = Date.now();
     this.item.command = 'voiceflow.toggleDictation';
-    this.item.tooltip = 'Press Ctrl+Alt+L to stop, Esc to cancel';
+    this.item.tooltip =
+      flavor === 'system'
+        ? 'Capturing SYSTEM AUDIO (all sound your computer plays). Ctrl+Alt+L to stop, Esc to cancel'
+        : 'Press Ctrl+Alt+L to stop, Esc to cancel';
     this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
     this.renderRecording();
     this.timer = setInterval(() => this.renderRecording(), 1000);
@@ -113,7 +120,11 @@ export class StatusBar implements vscode.Disposable {
     const ss = String(secs % 60).padStart(2, '0');
     // 在录 + 在转并行呈现(P2b:✍N = 管线中未完成段数)
     const seg = this.pendingSegments > 0 ? ` ✍${this.pendingSegments}` : '';
-    this.item.text = `$(record) VoiceFlow ${mm}:${ss}${seg}`;
+    // 系统音频:图标 + SYS 标记全程明示(不是麦克风,评审 v5-⑤)
+    this.item.text =
+      this.flavor === 'system'
+        ? `$(broadcast) VoiceFlow SYS ${mm}:${ss}${seg}`
+        : `$(record) VoiceFlow ${mm}:${ss}${seg}`;
   }
 
   private stopTimer(): void {

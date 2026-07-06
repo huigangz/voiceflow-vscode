@@ -12,6 +12,7 @@
   },
   "files": {
     "voiceflow-mic.exe": { "source": "prebuilt", "sha256": "8cf36f8f1bdf2e82770ba919591731eecbe99ce10b2816077d08c69e46576b98" },
+    "voiceflow-audio.node": { "source": "prebuilt", "sha256": "39c7a07ab00f55334f52056054b60531ceb3261b61ec85605073a5b981e17361", "_note": "P2c 自研 miniaudio loopback addon;重编译走 build-audio-addon.mjs 并同步本 SHA" },
     "whisper-cli.exe": { "source": "whisper", "sha256": "58245314fb73b30fbd0cf0542c5c172e23f02b6eb7cad7b51e792439cf5e1755" },
     "whisper-server.exe": { "source": "whisper", "sha256": "2c1ef08694756eda280e79b8217da63ee2af33c87ac3d5f27d68f9f3f966fd32" },
     "whisper.dll": { "source": "whisper", "sha256": "b31690c12461517fe9774e61318ab63a69972b948151feed98b913be35f708b6" },
@@ -33,6 +34,18 @@
       "license": "Apache-2.0",
       "sha256": "4f6457d2b6b1fbe8bf33c259de6387b423c452ebaff791dfbdda7daedb90ac27",
       "_note": "P2a:1.2.8/1.2.9 同哈希(worklog p2a1);npm tarball 原样分发,SAC 依赖全球共享哈希 ISG 养熟;升级 pin 时必须更新本 SHA"
+    },
+    "node_modules/onnxruntime-node/bin/napi-v6/win32/x64/onnxruntime_binding.node": {
+      "package": "onnxruntime-node@1.27.0",
+      "license": "MIT",
+      "sha256": "dd50eb632300170576fda3648f4fcf00fbd44afca6a70efa53c57f85b272faf2",
+      "_note": "P2c:Silero VAD 推理运行时(微软官方 npm,共享哈希)"
+    },
+    "node_modules/onnxruntime-node/bin/napi-v6/win32/x64/onnxruntime.dll": {
+      "package": "onnxruntime-node@1.27.0",
+      "license": "MIT",
+      "sha256": "273f9ef9cf755c6a0f342226a80448156c10ceb74db2ae8c8370dc98e75af0eb",
+      "_note": "P2c:CPU EP;DirectML 三 DLL 不随包分发(GPU EP 不使用,解包 require+推理硬性项验证)"
     }
   }
 }
