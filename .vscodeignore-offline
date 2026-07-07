@@ -42,3 +42,4 @@ CLAUDE.md
 models/**
 *.vsix
 voiceflow-inprocess-stt-plan.md
+voiceflow-chat-insert-plan.md

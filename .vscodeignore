@@ -44,3 +44,4 @@ models/**
 # 评审 v7-①:普通 package 永不带模型(不再依赖"目录为空");offline 打包用 .vscodeignore-offline
 offline-model/**
 voiceflow-inprocess-stt-plan.md
+voiceflow-chat-insert-plan.md
