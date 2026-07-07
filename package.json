@@ -2,7 +2,7 @@
   "name": "voiceflow-vscode",
   "displayName": "VoiceFlow",
   "description": "Wispr Flow-style local voice dictation: press a key and speak, transcribe locally with whisper, clean up, and insert into the editor or terminal. Audio never leaves your machine.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "publisher": "voiceflow-preview",
   "license": "MIT",
@@ -271,7 +271,7 @@
     "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
     "package": "vsce package --target win32-x64",
     "stage-model": "node scripts/stage-bundled-model.mjs",
-    "package:bundled": "node scripts/stage-bundled-model.mjs && node scripts/stage-bundled-model.mjs --onnx && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.3.0-offline.vsix"
+    "package:bundled": "node scripts/stage-bundled-model.mjs && node scripts/stage-bundled-model.mjs --onnx && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.3.1-offline.vsix"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
