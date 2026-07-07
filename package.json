@@ -79,6 +79,14 @@
         }
       },
       {
+        "command": "voiceflow.toggleDictation",
+        "key": "ctrl+alt+l",
+        "when": "inputFocus && !editorTextFocus && !terminalFocus",
+        "args": {
+          "focus": "input"
+        }
+      },
+      {
         "command": "voiceflow.cancelSession",
         "key": "escape",
         "when": "voiceflow.sessionActive && !suggestWidgetVisible && !inSnippetMode && !renameInputVisible && !inlineSuggestionVisible && !parameterHintsVisible && !findWidgetVisible && !terminalFindVisible"
@@ -188,6 +196,11 @@
           "type": "number",
           "default": 30,
           "description": "If a recording exceeds this many seconds, show a lightweight confirmation before inserting; 0 = disabled."
+        },
+        "voiceflow.insert.typeIntoFocusedInput": {
+          "type": "boolean",
+          "default": false,
+          "description": "When dictation starts with focus in an input widget that is not an editor or terminal (e.g. the Copilot Chat input), type the result into it automatically. Caution: if you focus a code editor while recording, the text may be typed at the editor cursor, bypassing the usual position checks — the clipboard always keeps a copy. Off = copy to clipboard only (default)."
         },
         "voiceflow.whisper.binaryDir": {
           "type": "string",

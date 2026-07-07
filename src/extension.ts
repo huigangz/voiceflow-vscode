@@ -26,11 +26,18 @@ import { BlockedMemory, EngineManager, resolveEngineMode } from './stt/engineMan
 import { InprocessEngine } from './stt/inprocessEngine';
 import { normalizeDetectedLanguage } from './stt/engine';
 import { InprocessTier } from './stt/onnxModels';
-import { FocusHint, InsertTarget, captureTarget, dispatchInsert } from './insert/dispatcher';
+import {
+  FocusHint,
+  FocusedInputOpts,
+  InsertTarget,
+  captureTarget,
+  dispatchInsert,
+} from './insert/dispatcher';
 import { SegmentInserter } from './insert/segmentInserter';
 import { SegmentPipeline } from './segment/pipeline';
 import { validateSegmentedConfig } from './segment/config';
 import { RulesConfig, applyRules } from './cleanup/rulesLayer';
+import { isRealEditorDocScheme } from './insert/logic';
 import { CleanupCancelled, EnhanceProvider, runCleanup } from './cleanup/pipeline';
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
 import { CliKind, createCliProvider } from './cleanup/cliProvider';
@@ -65,6 +72,46 @@ interface SegmentedSession {
   stopping: boolean;
 }
 let segmented: SegmentedSession | undefined;
+
+/**
+ * chat-insert v1(plan v5 §3.1):focused-input 会话的编辑器交互防线(best-effort,v4-①)
+ * + 确认框标记(v4-③)。extension 持生命周期,dispatcher 只收布尔判定。
+ */
+let focusedInputTracker:
+  | { interacted: boolean; confirmShown: boolean; disposables: vscode.Disposable[] }
+  | undefined;
+
+function armFocusedInputTracker(): void {
+  disposeFocusedInputTracker();
+  const t = { interacted: false, confirmShown: false, disposables: [] as vscode.Disposable[] };
+  // 只认真实文档编辑器(t3 实测修:输出面板/调试控制台也是 editor,自家日志会稳定误报防线)
+  t.disposables.push(
+    vscode.window.onDidChangeActiveTextEditor((e) => {
+      if (isRealEditorDocScheme(e?.document.uri.scheme)) t.interacted = true;
+    }),
+    vscode.window.onDidChangeTextEditorSelection((e) => {
+      if (isRealEditorDocScheme(e.textEditor.document.uri.scheme)) t.interacted = true;
+    }),
+  );
+  focusedInputTracker = t;
+}
+
+/** 幂等释放(v5-①);挂三处:启动失败 catch / cancelSession / stopRecordingAndProcess finally。 */
+function disposeFocusedInputTracker(): void {
+  focusedInputTracker?.disposables.forEach((d) => d.dispose());
+  focusedInputTracker = undefined;
+}
+
+/** dispatch 用的判定快照;tracker 缺失(异常路径)→ 保守不 type。 */
+function focusedInputOpts(): FocusedInputOpts {
+  return {
+    enabled: vscode.workspace
+      .getConfiguration('voiceflow')
+      .get<boolean>('insert.typeIntoFocusedInput', false),
+    editorInteracted: focusedInputTracker?.interacted ?? true,
+    confirmShown: focusedInputTracker?.confirmShown ?? true,
+  };
+}
 
 function log(line: string): void {
   output.appendLine(`${new Date().toISOString().slice(11, 23)} ${line}`);
@@ -304,6 +351,7 @@ async function startBatchSession(
   // F4:插入目标在录音开始时锁定
   insertTarget = captureTarget(focusHint);
   log(`[dictation] target locked: ${insertTarget.kind}`);
+  if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
   session.dispatch('start');
   try {
     recording = await startWithRecorderFallback(cfg, (r) => buildController(r, cfg));
@@ -313,6 +361,7 @@ async function startBatchSession(
     statusBar.showError('Failed to start recording');
     recording?.dispose();
     recording = undefined;
+    disposeFocusedInputTracker(); // v5-① 挂点①:启动失败不经处理流程 finally
     if (err instanceof RecorderError) void showRecorderError(err);
     else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
   }
@@ -386,7 +435,16 @@ async function startSegmentedSession(
 
   insertTarget = captureTarget(focusHint);
   log(`[dictation] target locked: ${insertTarget.kind} (segmented)`);
-  const inserter = new SegmentInserter(insertTarget, log);
+  // chat-insert v6-B:focused-input 逐段累计(同 none),正常结束单次注入(dispatch 全套判定)
+  if (insertTarget.kind === 'focused-input') armFocusedInputTracker();
+  const inserter = new SegmentInserter(insertTarget, log, async (text) => {
+    const fiOpts = focusedInputOpts();
+    log(
+      `[insert] focused-input gates (segmented flush): enabled=${fiOpts.enabled} ` +
+        `editorInteracted=${fiOpts.editorInteracted} confirmShown=${fiOpts.confirmShown}`,
+    );
+    await dispatchInsert({ kind: 'focused-input' }, text, fiOpts);
+  });
 
   // ③ 并行预热(评审 v6-⑥):会话 lease 先行(v11-②);prepare 失败不阻会话,首段会再试
   const warmup = (async () => {
@@ -564,10 +622,11 @@ async function stopSegmentedSession(reason: string): Promise<void> {
     log(`[dictation] recording ended (${durationMs}ms), draining ${s.pending} pending segment(s)…`);
     await s.pipeline.drained();
     if (segmented !== s) return; // drain 期间 fatal/Esc 已 teardown
-    await s.inserter.finishSession(); // 终端 Send/Copy 确认(v7-⑤)/ 累计入剪贴板(v4-② 正常停止路径)
+    await s.inserter.finishSession(); // 终端 Send/Copy 确认(v7-⑤)/ focused-input 单次注入(v6-B)/ 累计入剪贴板
     segmented = undefined;
     s.controller.dispose();
     s.releaseLease?.();
+    disposeFocusedInputTracker(); // v6-B:segmented 正常结束收口(注入判定已在 finishSession 内取过快照)
     statusBar.setSegmentActivity(0);
     session.dispatch('drained');
     log(`[metrics] segmented session done: inserted=${s.inserter.stats.inserted}`);
@@ -587,6 +646,7 @@ function teardownSegmented(kind: 'error' | 'cancel'): void {
   s.controller?.cancel();
   s.controller?.dispose();
   s.releaseLease?.();
+  disposeFocusedInputTracker(); // chat-insert v6-B 挂点④(错误/Esc 路径 flushFallback 只剪贴板,不注入)
   statusBar.setSegmentActivity(0);
   session.dispatch(kind);
 }
@@ -651,6 +711,8 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       .getConfiguration('voiceflow')
       .get<number>('recording.confirmThreshold', 30);
     if (confirmThreshold > 0 && result.durationMs > confirmThreshold * 1000) {
+      // chat-insert v4-③:确认框是扩展自己造成的焦点变化,该会话定死不 type
+      if (focusedInputTracker) focusedInputTracker.confirmShown = true;
       const preview = cleaned.length > 80 ? `${cleaned.slice(0, 80)}…` : cleaned;
       const choice = await vscode.window.showQuickPick(['Insert', 'Copy to clipboard', 'Discard'], {
         placeHolder: `Long recording (${(result.durationMs / 1000).toFixed(0)}s) — confirm: ${preview}`,
@@ -667,9 +729,17 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       }
     }
 
-    // Step 3:插入分发(F4 表)
+    // Step 3:插入分发(F4 表;focused-input 判定快照随 dispatch 传入,chat-insert v1)
     const t0 = Date.now();
-    const outcome = await dispatchInsert(insertTarget, cleaned);
+    const fiOpts = focusedInputOpts();
+    if (insertTarget.kind === 'focused-input') {
+      // 三闸快照(t3 实测加):outcome=clipboard 时一眼定位是哪闸拦的
+      log(
+        `[insert] focused-input gates: enabled=${fiOpts.enabled} ` +
+          `editorInteracted=${fiOpts.editorInteracted} confirmShown=${fiOpts.confirmShown}`,
+      );
+    }
+    const outcome = await dispatchInsert(insertTarget, cleaned, fiOpts);
     session.dispatch('inserted');
     log(`[metrics] insert=${Date.now() - t0}ms outcome=${outcome}`);
   } catch (err) {
@@ -684,6 +754,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
   } finally {
     recording?.dispose();
     recording = undefined;
+    disposeFocusedInputTracker(); // v5-① 挂点③:转写失败/空文本/Copy/Discard/正常完成全收口
     // 临时 WAV 用完即删(隐私:音频不留盘)
     if (wavUri) {
       try {
@@ -730,6 +801,7 @@ function cancelSession(): void {
   recording?.cancel();
   recording?.dispose();
   recording = undefined;
+  disposeFocusedInputTracker(); // v5-① 挂点②:录音期 Esc 不经处理流程 finally
   sttAbort?.abort(); // 中止进行中的转写(CLI kill / HTTP abort;server 进程保留,v10-① 双信号)
   sttAbort = undefined;
   cleaningAbort?.abort(); // 中止进行中的清理(LLM 请求 / CLI 子进程)

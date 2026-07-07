@@ -33,6 +33,12 @@ export class SegmentInserter {
   constructor(
     private readonly target: InsertTarget,
     private readonly log: (line: string) => void,
+    /**
+     * chat-insert v6-B:focused-input 目标的**正常结束**单次注入(extension 注入,
+     * 内部 = dispatchInsert 全套三闸/type/验证撤销/剪贴板/文案)。Esc/错误路径的
+     * flushFallback 不走此通道(取消后注入是意外行为),维持纯剪贴板。
+     */
+    private readonly typeFlush?: (text: string) => Promise<void>,
   ) {
     this.live = target.kind === 'editor';
     if (!this.live) {
@@ -157,6 +163,16 @@ export class SegmentInserter {
         await vscode.env.clipboard.writeText(text);
         vscode.window.setStatusBarMessage('$(clippy) VoiceFlow: Copied to clipboard', 5000);
       }
+      return;
+    }
+    // chat-insert v6-B:focused-input 正常结束 = 单次注入点(与 batch 同风险面,D3 逐段顾虑不适用)
+    if (this.target.kind === 'focused-input' && this.accumulated.length > 0 && this.typeFlush) {
+      const text = joinAll(this.accumulated);
+      const n = this.accumulated.length;
+      this.accumulated = [];
+      this.flushed = true;
+      this.log(`[inserter] finishSession(focused-input): ${n} segment(s), ${text.length} chars → type flush`);
+      await this.typeFlush(text);
       return;
     }
     this.flushFallback('session-end');
