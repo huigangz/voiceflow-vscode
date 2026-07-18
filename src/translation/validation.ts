@@ -1,6 +1,6 @@
 /** Explicit translation-task refusals only; ordinary apologies or inability statements are valid content. */
 export const TRANSLATION_META_REFUSAL_RE =
-  /(?:作为(?:一名|一个)?\s*(?:AI|人工智能)|(?:无法|不能)(?:处理|翻译)(?:您|你)?(?:所)?提供的(?:内容|文本)|I\s+(?:cannot|can't|am unable to)\s+(?:translate|provide))/iu;
+  /(?:(?:无法|不能)(?:帮助|协助)?翻译(?:(?:您|你)?(?:所)?(?:提供的)?(?:内容|文本|请求)|此内容)|(?:无法|不能)处理(?:(?:您|你)?(?:所)?提供的(?:内容|文本)|(?:这个|该|此)(?:请求|内容))|I\s+(?:cannot|can't|am unable to)\s+(?:translate|provide))/iu;
 
 const TASK_META_PREFIX_RE =
   /^(?:以下是(?:本次|该)?翻译结果|翻译如下|here is the translation)\s*[:：\-—]?/iu;

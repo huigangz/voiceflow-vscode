@@ -16,6 +16,8 @@ describe('translation-aware post-validation', () => {
 
   it.each([
     '作为 AI，我不能帮助翻译此内容。',
+    '作为 AI 助手，我无法翻译所提供的内容。',
+    '作为语言模型，我不能处理这个请求。',
     '我无法处理所提供的内容。',
     '无法翻译您所提供的文本。',
     'I cannot translate the provided content.',
@@ -23,6 +25,15 @@ describe('translation-aware post-validation', () => {
   ])('rejects explicit meta replies: %s', (output) => {
     expect(TRANSLATION_META_REFUSAL_RE.test(output)).toBe(true);
     expect(isTranslationOutputRejected('hello', output)).toBe(true);
+  });
+
+  it.each([
+    '作为 AI 工程师，我构建模型。',
+    '这段内容讨论 AI 如何协助工程师构建模型。',
+    '作为 AI 工程师，我无法参加今天的会议。',
+  ])('allows AI identity/discussion content without an explicit task refusal: %s', (output) => {
+    expect(TRANSLATION_META_REFUSAL_RE.test(output)).toBe(false);
+    expect(isTranslationOutputRejected('source text', output)).toBe(false);
   });
 
   it.each(['以下是翻译结果：你好', '翻译如下：你好', 'Here is the translation: 你好'])(
