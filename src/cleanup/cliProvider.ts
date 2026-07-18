@@ -58,6 +58,27 @@ export type CliResolver = (
   signal: AbortSignal,
 ) => Promise<CliResolutionResult>;
 
+function codexSafeExecArgs(context: CliExecutionContext): string[] {
+  return [
+    'exec',
+    '--strict-config',
+    // Transcript text is untrusted prompt data; disable shell reads that prompt injection could trigger.
+    '--disable',
+    'shell_tool',
+    // Avoid collecting a local shell-environment snapshot for a provider that must not use shell access.
+    '--disable',
+    'shell_snapshot',
+    '--ephemeral',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--sandbox',
+    'read-only',
+    '--skip-git-repo-check',
+    '-C',
+    context.neutralDirectory,
+  ];
+}
+
 /** Each instruction occupies one argv element; transcript data is carried separately on stdin. */
 export function buildCliInvocation(
   kind: CliKind,
@@ -86,15 +107,7 @@ export function buildCliInvocation(
       return {
         executable: 'codex',
         args: [
-          'exec',
-          '--ephemeral',
-          '--ignore-user-config',
-          '--ignore-rules',
-          '--sandbox',
-          'read-only',
-          '--skip-git-repo-check',
-          '-C',
-          context.neutralDirectory,
+          ...codexSafeExecArgs(context),
           instruction,
         ],
         cwd: context.neutralDirectory,
@@ -106,8 +119,16 @@ export function buildCliProbeInvocation(
   kind: CliKind,
   context: CliExecutionContext,
 ): CliInvocation {
+  if (kind === 'codex-cli') {
+    return {
+      executable: 'codex',
+      // `--help` validates the complete local parser surface without sending a model request.
+      args: [...codexSafeExecArgs(context), '--help'],
+      cwd: context.neutralDirectory,
+    };
+  }
   return {
-    executable: kind === 'claude-cli' ? 'claude' : 'codex',
+    executable: 'claude',
     args: ['--version'],
     cwd: context.neutralDirectory,
   };
@@ -394,8 +415,22 @@ export function createCliProvider(
         if (signal.aborted) return { ok: false, kind: 'aborted' };
         if (result.ok) return { ok: true };
         const failure = classifyFailure(result, signal);
+        if (kind === 'codex-cli' && failure.kind !== 'aborted') {
+          return {
+            ok: false,
+            kind: 'unavailable',
+            message: `Codex CLI cannot enforce the required shell_tool/shell_snapshot-disabled invocation: ${failure.message}`,
+          };
+        }
         return { ok: false, ...failure };
       } catch (error) {
+        if (kind === 'codex-cli' && !signal.aborted) {
+          return {
+            ok: false,
+            kind: 'unavailable',
+            message: `Codex CLI cannot enforce the required shell_tool/shell_snapshot-disabled invocation: ${String(error)}`,
+          };
+        }
         return {
           ok: false,
           kind: signal.aborted ? 'aborted' : 'error',

@@ -179,6 +179,11 @@ describe('buildCliInvocation', () => {
       executable: 'codex',
       args: [
         'exec',
+        '--strict-config',
+        '--disable',
+        'shell_tool',
+        '--disable',
+        'shell_snapshot',
         '--ephemeral',
         '--ignore-user-config',
         '--ignore-rules',
@@ -201,7 +206,23 @@ describe('buildCliInvocation', () => {
     });
     expect(buildCliProbeInvocation('codex-cli', executionContext)).toEqual({
       executable: 'codex',
-      args: ['--version'],
+      args: [
+        'exec',
+        '--strict-config',
+        '--disable',
+        'shell_tool',
+        '--disable',
+        'shell_snapshot',
+        '--ephemeral',
+        '--ignore-user-config',
+        '--ignore-rules',
+        '--sandbox',
+        'read-only',
+        '--skip-git-repo-check',
+        '-C',
+        executionContext.neutralDirectory,
+        '--help',
+      ],
       cwd: executionContext.neutralDirectory,
     });
   });
@@ -327,7 +348,7 @@ describe('CLI LlmProvider', () => {
 
       expect(calls[1]).toEqual({
         executable: nativePath,
-        args: ['--version'],
+        args: buildCliProbeInvocation('codex-cli', executionContext).args,
         cwd: executionContext.neutralDirectory,
       });
     },
@@ -364,7 +385,7 @@ describe('CLI LlmProvider', () => {
       expect(calls[0]).toEqual({ executable: 'where.exe', args: ['codex'] });
       expect(calls[1]).toEqual({
         executable: 'node.exe',
-        args: [cliPath, '--version'],
+        args: [cliPath, ...buildCliProbeInvocation('codex-cli', executionContext).args],
         cwd: executionContext.neutralDirectory,
       });
       expect(result.ok).toBe(true);
@@ -453,6 +474,80 @@ describe('CLI LlmProvider', () => {
     );
 
     expect(result).toMatchObject({ ok: false, kind: 'aborted' });
+  });
+
+  it('codex prepare fails closed when the local CLI rejects the shell-disabled exec probe', async () => {
+    const calls: CliInvocation[] = [];
+    const runner: CliCommandRunner = async (invocation) => {
+      calls.push(invocation);
+      return {
+        ok: false,
+        kind: 'exit',
+        code: 2,
+        stdout: '',
+        stderr: "error: unexpected argument '--disable'",
+      };
+    };
+
+    const result = await createCliProvider(
+      'codex-cli',
+      executionContext,
+      runner,
+      directResolver,
+    ).prepare(new AbortController().signal);
+
+    expect(calls).toEqual([buildCliProbeInvocation('codex-cli', executionContext)]);
+    expect(result).toMatchObject({
+      ok: false,
+      kind: 'unavailable',
+      message: expect.stringContaining('shell_tool'),
+    });
+  });
+
+  it('codex prepare maps a rejected safety probe to unavailable', async () => {
+    const runner: CliCommandRunner = async () => {
+      throw new Error('probe runner failed');
+    };
+
+    const result = await createCliProvider(
+      'codex-cli',
+      executionContext,
+      runner,
+      directResolver,
+    ).prepare(new AbortController().signal);
+
+    expect(result).toMatchObject({
+      ok: false,
+      kind: 'unavailable',
+      message: expect.stringContaining('shell_tool'),
+    });
+  });
+
+  it('never retries a failed codex invocation without shell_tool disabled', async () => {
+    const calls: CliInvocation[] = [];
+    const runner: CliCommandRunner = async (invocation) => {
+      calls.push(invocation);
+      return {
+        ok: false,
+        kind: 'exit',
+        code: 2,
+        stdout: '',
+        stderr: "error: unexpected argument '--disable'",
+      };
+    };
+    const instruction = 'Translate only';
+
+    const result = await createCliProvider(
+      'codex-cli',
+      executionContext,
+      runner,
+      directResolver,
+    ).run(instruction, 'untrusted transcript', new AbortController().signal);
+
+    expect(result).toMatchObject({ ok: false, kind: 'error' });
+    expect(calls).toEqual([buildCliInvocation('codex-cli', instruction, executionContext)]);
+    expect(calls[0]?.args).toContain('shell_tool');
+    expect(calls[0]?.args).toContain('shell_snapshot');
   });
 
   it('run keeps arbitrary instruction and wrapped transcript separate and estimates full usage', async () => {
