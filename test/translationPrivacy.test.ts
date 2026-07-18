@@ -22,4 +22,35 @@ describe('translation privacy notice', () => {
     expect(maybeShowTranslationPrivacyNotice(state, show)).toBe(false);
     expect(show).toHaveBeenCalledOnce();
   });
+
+  it('claims the in-process notice before persistence so concurrent calls show only once', () => {
+    const state = {
+      get: <T>(_key: string) => undefined as T | undefined,
+      update: vi.fn(() => new Promise<void>(() => {})),
+    };
+    const show = vi.fn(async (_message: string) => undefined);
+    expect(maybeShowTranslationPrivacyNotice(state, show)).toBe(true);
+    expect(maybeShowTranslationPrivacyNotice(state, show)).toBe(false);
+    expect(show).toHaveBeenCalledOnce();
+    expect(state.update).toHaveBeenCalledOnce();
+  });
+
+  it('contains synchronous and asynchronous persistence failures without repeating the notice', async () => {
+    const asyncFailure = {
+      get: <T>(_key: string) => undefined as T | undefined,
+      update: vi.fn(async () => { throw new Error('write rejected'); }),
+    };
+    const show = vi.fn(async (_message: string) => undefined);
+    expect(maybeShowTranslationPrivacyNotice(asyncFailure, show)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(maybeShowTranslationPrivacyNotice(asyncFailure, show)).toBe(false);
+
+    const syncFailure = {
+      get: <T>(_key: string) => undefined as T | undefined,
+      update: vi.fn((): Promise<void> => { throw new Error('write threw'); }),
+    };
+    expect(() => maybeShowTranslationPrivacyNotice(syncFailure, show)).not.toThrow();
+    expect(maybeShowTranslationPrivacyNotice(syncFailure, show)).toBe(false);
+    expect(show).toHaveBeenCalledTimes(2);
+  });
 });

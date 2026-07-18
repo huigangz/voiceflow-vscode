@@ -366,6 +366,29 @@ describe('target=zh provider preflight', () => {
     )).rejects.toThrow(/cancelled.*aborted/i);
   });
 
+  it('accounts authorization usage exactly once when an aborted prepare made a real request', async () => {
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    const controller = new AbortController();
+    const authorizationUsage = vi.fn();
+    const usage = { inputTokens: 4, outputTokens: 1, estimate: false } as const;
+    await expect(prepareTranslationSnapshot(
+      base,
+      vi.fn(),
+      async () => ({
+        name: 'cancelled-after-request',
+        prepare: async () => {
+          controller.abort();
+          return { ok: false as const, kind: 'aborted' as const, usage };
+        },
+        run: vi.fn(),
+      }),
+      controller.signal,
+      authorizationUsage,
+    )).rejects.toMatchObject({ name: 'CleanupCancelled' });
+    expect(authorizationUsage).toHaveBeenCalledOnce();
+    expect(authorizationUsage).toHaveBeenCalledWith(usage);
+  });
+
   it.each(['off', 'en'] as const)('target=%s never selects or prepares an LLM provider', async (target) => {
     const selectProvider = vi.fn();
     const resolveCapabilities = vi.fn(async () => ({

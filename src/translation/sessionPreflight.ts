@@ -77,7 +77,6 @@ export async function prepareTranslationSnapshot(
       `LLM provider ${provider.name} prepare failed: ${String(error)}`,
     );
   }
-  if (signal.aborted) throw new CleanupCancelled();
   if (prepared.usage !== undefined) {
     try {
       onAuthorizationUsage?.(prepared.usage);
@@ -85,6 +84,7 @@ export async function prepareTranslationSnapshot(
       // Usage persistence cannot change admission semantics.
     }
   }
+  if (signal.aborted) throw new CleanupCancelled();
   if (!prepared.ok) {
     throw new TranslationUnsupportedError(
       `LLM provider ${provider.name} prepare failed (${prepared.kind}): ${prepared.message ?? 'unavailable'}`,

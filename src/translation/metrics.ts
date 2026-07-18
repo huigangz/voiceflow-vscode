@@ -53,6 +53,19 @@ export class TranslationSessionMetrics {
     if (outcome === 'identity') this.identityLatencyMs.push(latency);
   }
 
+  deferVisibleObservation(
+    outcome: TranslationOutcome,
+    startedAt: number,
+    now: () => number = Date.now,
+  ): () => void {
+    let completed = false;
+    return () => {
+      if (completed) return;
+      completed = true;
+      this.observe(outcome, now() - startedAt);
+    };
+  }
+
   snapshot(): TranslationMetricsSnapshot {
     const totalSegments = Object.values(this.outcomes).reduce((sum, value) => sum + value, 0);
     const identitySegments = this.outcomes.identity;

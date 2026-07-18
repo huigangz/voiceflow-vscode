@@ -263,6 +263,28 @@ describe('SegmentPipeline', () => {
     expect(observed.mock.calls[0]?.[2]).toBeGreaterThanOrEqual(0);
   });
 
+  it('does not report visible completion until insertion has finished', async () => {
+    const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
+    let finishInsert!: () => void;
+    let insertStarted!: () => void;
+    const started = new Promise<void>((resolve) => { insertStarted = resolve; });
+    t.deps.cleanup = async () => ({ text: '你好', outcome: 'translated' });
+    t.deps.insert = async () => {
+      insertStarted();
+      await new Promise<void>((resolve) => { finishInsert = resolve; });
+    };
+    const observed = vi.fn();
+    t.deps.onResult = observed;
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(4));
+
+    await started;
+    expect(observed).not.toHaveBeenCalled();
+    finishInsert();
+    await p.drained();
+    expect(observed).toHaveBeenCalledOnce();
+  });
+
   it('CleanupCancelled stops the segment without insertion or fatal callback', async () => {
     const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
     t.deps.cleanup = async () => { throw new CleanupCancelled(); };

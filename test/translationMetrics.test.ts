@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { TranslationSessionMetrics } from '../src/translation/metrics';
 
 describe('target=zh session metrics', () => {
@@ -50,6 +50,19 @@ describe('target=zh session metrics', () => {
     expect(metrics.summary()).toMatchObject({
       translatedLatency: { p50: 30, p95: 50 },
       identityLatency: { p50: 2, p95: 4 },
+    });
+  });
+
+  it('defers batch visible latency until output completion and records it once', () => {
+    const metrics = new TranslationSessionMetrics();
+    const finish = metrics.deferVisibleObservation('translated', 100, vi.fn(() => 135));
+    expect(metrics.snapshot().totalSegments).toBe(0);
+    finish();
+    finish();
+    expect(metrics.snapshot()).toMatchObject({
+      totalSegments: 1,
+      translatedLatencyMs: [35],
+      visibleLatencyMs: [35],
     });
   });
 });

@@ -1000,6 +1000,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
   if (!recording || session.state !== 'recording') return;
   session.dispatch('stopRecording');
   let wavUri: vscode.Uri | undefined;
+  let finishTranslationObservation: (() => void) | undefined;
   try {
     const result = await recording.finish();
     wavUri = result.wavUri;
@@ -1054,7 +1055,10 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
         cleaningAbort.signal,
       );
       cleaned = translated.text;
-      activeTranslation.metrics.observe(translated.outcome, Date.now() - translationStartedAt);
+      finishTranslationObservation = activeTranslation.metrics.deferVisibleObservation(
+        translated.outcome,
+        translationStartedAt,
+      );
       const notice = activeTranslation.feedback.notificationFor(translated);
       if (notice !== undefined) void vscode.window.showWarningMessage(notice);
       log(`[translation] batch ${translated.outcome}` +
@@ -1086,6 +1090,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     session.dispatch('cleaned');
 
     if (cleaned.length === 0) {
+      finishTranslationObservation?.();
       log('[dictation] empty transcription, nothing to insert');
       session.dispatch('cancel');
       return;
@@ -1108,6 +1113,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       }
       if (choice === 'Copy to clipboard') {
         await vscode.env.clipboard.writeText(cleaned);
+        finishTranslationObservation?.();
         vscode.window.setStatusBarMessage('$(clippy) VoiceFlow: Copied to clipboard', 5000);
         session.dispatch('cancel');
         return;
@@ -1125,6 +1131,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       );
     }
     const outcome = await dispatchInsert(insertTarget, cleaned, fiOpts);
+    finishTranslationObservation?.();
     session.dispatch('inserted');
     log(`[metrics] insert=${Date.now() - t0}ms outcome=${outcome}`);
   } catch (err) {
