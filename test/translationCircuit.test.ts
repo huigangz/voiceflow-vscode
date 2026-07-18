@@ -74,4 +74,16 @@ describe('TranslationCoordinator', () => {
     await coordinator.run('three', 'en', new AbortController().signal);
     expect(coordinator.isOpen).toBe(true);
   });
+
+  it.each([
+    ['empty rules', () => ''],
+    ['throwing rules', () => { throw new Error('rules failed'); }],
+  ])('circuit-open preserves non-empty source when %s fallback cannot produce text', async (_name, rules) => {
+    const coordinator = new TranslationCoordinator(async () => result('translated'), rules);
+    coordinator.openForBacklog(31_000);
+    await expect(coordinator.run(' source text ', 'en', new AbortController().signal)).resolves.toEqual({
+      text: 'source text',
+      outcome: 'circuit-open',
+    });
+  });
 });

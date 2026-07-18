@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   TRANSLATION_META_REFUSAL_RE,
+  compareTranslationEcho,
   isTranslationOutputRejected,
 } from '../src/translation/validation';
 
@@ -29,6 +30,21 @@ describe('translation-aware post-validation', () => {
   ])('rejects explicit meta replies: %s', (output) => {
     expect(TRANSLATION_META_REFUSAL_RE.test(output)).toBe(true);
     expect(isTranslationOutputRejected('hello', output)).toBe(true);
+  });
+
+  it('allows translation of source content that is itself a detectable explicit refusal', () => {
+    const source = 'I cannot translate the provided text.';
+    const translated = '我无法翻译所提供的文本。';
+    expect(TRANSLATION_META_REFUSAL_RE.test(source)).toBe(true);
+    expect(TRANSLATION_META_REFUSAL_RE.test(translated)).toBe(true);
+    expect(isTranslationOutputRejected(source, translated)).toBe(false);
+  });
+
+  it('still rejects an explicit provider refusal for an ordinary source', () => {
+    expect(isTranslationOutputRejected(
+      'Please deploy the build.',
+      'I cannot translate the provided content.',
+    )).toBe(true);
   });
 
   it.each([
@@ -67,6 +83,40 @@ describe('translation-aware post-validation', () => {
 
   it('rejects a near-echo when source differs from target', () => {
     expect(isTranslationOutputRejected('Please deploy version 2 now!', 'Please deploy version 2 now.')).toBe(true);
+  });
+
+  it('uses bounded distance for near echo but not a materially different translation', () => {
+    const near = compareTranslationEcho(
+      'Please deploy version 2000 to production now',
+      'Please deploy version 2001 to production now',
+    );
+    const far = compareTranslationEcho(
+      'Please deploy version 2000 to production now',
+      '请立即将版本 2000 部署到生产环境',
+    );
+    expect(near.isEcho).toBe(true);
+    expect(near.operations).toBeGreaterThan(0);
+    expect(far.isEcho).toBe(false);
+  });
+
+  it('rejects impossible length deltas before distance work', () => {
+    const comparison = compareTranslationEcho('abcdefghij', 'abcdefghij'.repeat(100));
+    expect(comparison).toMatchObject({ isEcho: false, operations: 0, skippedByLength: true });
+  });
+
+  it('bounds edit operations for large adversarial equal-length input', () => {
+    const length = 10_000;
+    const comparison = compareTranslationEcho('a'.repeat(length), 'b'.repeat(length));
+    expect(comparison.isEcho).toBe(false);
+    expect(comparison.maxEdits).toBe(32);
+    expect(comparison.operations).toBeLessThanOrEqual(length * (2 * comparison.maxEdits + 1));
+    expect(comparison.operations).toBeLessThan(length * length / 100);
+  });
+
+  it('does not classify a legitimate long translation as near echo', () => {
+    const source = 'This is a detailed English sentence about a production deployment. '.repeat(300);
+    const translated = '这是一段关于生产部署的详细中文说明。'.repeat(300);
+    expect(compareTranslationEcho(source, translated).isEcho).toBe(false);
   });
 
   it('does not reject high residual non-target language by itself', () => {

@@ -6,6 +6,7 @@ import {
 } from '../cleanup/llmProvider';
 import { applyRules, RulesConfig } from '../cleanup/rulesLayer';
 import { normalizeDetectedLanguage } from '../stt/engine';
+import { applyRulesPreservingNonEmpty } from './safeRules';
 import { isTranslationOutputRejected } from './validation';
 
 export const TRANSLATE_TO_ZH_PROMPT =
@@ -71,14 +72,16 @@ export async function runTranslate(
 ): Promise<TranslationResult> {
   const rawFallback = source.trim();
   let fallback = rawFallback;
-  const rulesFallback = (): string => {
-    const ruled = applyRules(source, opts.rules);
-    return ruled.length > 0 ? ruled : rawFallback;
-  };
+  const rulesTransform = (text: string): string => applyRules(text, opts.rules);
+  const rulesFallback = (): string =>
+    applyRulesPreservingNonEmpty(source, rulesTransform, opts.log);
   try {
     if (outerSignal?.aborted) throw new CleanupCancelled();
     if (normalizeDetectedLanguage(detectedLanguage) === 'zh') {
-      return { text: applyRules(source, opts.rules), outcome: 'identity' };
+      return {
+        text: applyRulesPreservingNonEmpty(source, rulesTransform, opts.log),
+        outcome: 'identity',
+      };
     }
     if (rawFallback.length === 0) return { text: '', outcome: 'empty' };
 
@@ -158,7 +161,7 @@ export async function runTranslate(
         return { text: fallback, outcome: 'rejected', provider: opts.provider.name, llmMs: elapsed, usage: providerResult.usage };
       }
       return {
-        text: applyRules(translated, opts.rules),
+        text: applyRulesPreservingNonEmpty(translated, rulesTransform, opts.log),
         outcome: 'translated',
         provider: opts.provider.name,
         llmMs: elapsed,
@@ -170,11 +173,7 @@ export async function runTranslate(
     }
   } catch (error) {
     if (error instanceof CleanupCancelled || outerSignal?.aborted) throw new CleanupCancelled();
-    try {
-      fallback = rulesFallback();
-    } catch {
-      // Preserve the raw non-empty segment if the deterministic dependency itself failed.
-    }
+    fallback = rulesFallback();
     safeLog(opts.log, `[translate] ${opts.provider.name} unexpected error: ${String(error).slice(0, 200)} -> source fallback`);
     return { text: fallback, outcome: 'error', provider: opts.provider.name };
   }

@@ -16,30 +16,77 @@ function normalizedForEcho(text: string): string {
   return text.normalize('NFKC').toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
 }
 
-function editDistance(a: string, b: string): number {
-  if (a.length > b.length) return editDistance(b, a);
-  let previous = Array.from({ length: a.length + 1 }, (_, index) => index);
-  for (let row = 1; row <= b.length; row++) {
-    const current = [row];
-    for (let column = 1; column <= a.length; column++) {
-      current[column] = Math.min(
-        current[column - 1]! + 1,
-        previous[column]! + 1,
-        previous[column - 1]! + (a[column - 1] === b[row - 1] ? 0 : 1),
-      );
-    }
-    previous = current;
-  }
-  return previous[a.length]!;
+const NEAR_ECHO_RATIO = 0.08;
+const MAX_NEAR_ECHO_EDITS = 32;
+
+export interface TranslationEchoComparison {
+  isEcho: boolean;
+  operations: number;
+  maxEdits: number;
+  skippedByLength: boolean;
 }
 
-function isEchoOrNearEcho(source: string, output: string): boolean {
+function boundedEditDistanceWithin(
+  a: string,
+  b: string,
+  maxEdits: number,
+): { within: boolean; operations: number } {
+  const outside = maxEdits + 1;
+  let operations = 0;
+  let previous = new Map<number, number>();
+  for (let column = 0; column <= Math.min(b.length, maxEdits); column++) {
+    previous.set(column, column);
+  }
+
+  for (let row = 1; row <= a.length; row++) {
+    const current = new Map<number, number>();
+    const start = Math.max(0, row - maxEdits);
+    const end = Math.min(b.length, row + maxEdits);
+    let rowMinimum = outside;
+    for (let column = start; column <= end; column++) {
+      operations++;
+      const distance = column === 0
+        ? row
+        : Math.min(
+            (current.get(column - 1) ?? outside) + 1,
+            (previous.get(column) ?? outside) + 1,
+            (previous.get(column - 1) ?? outside) +
+              (a[row - 1] === b[column - 1] ? 0 : 1),
+          );
+      const bounded = Math.min(distance, outside);
+      current.set(column, bounded);
+      rowMinimum = Math.min(rowMinimum, bounded);
+    }
+    if (rowMinimum > maxEdits) return { within: false, operations };
+    previous = current;
+  }
+  return { within: (previous.get(b.length) ?? outside) <= maxEdits, operations };
+}
+
+export function compareTranslationEcho(
+  source: string,
+  output: string,
+): TranslationEchoComparison {
   const a = normalizedForEcho(source);
   const b = normalizedForEcho(output);
-  if (a.length === 0 || b.length === 0) return false;
-  if (a === b) return true;
   const longest = Math.max(a.length, b.length);
-  return longest >= 8 && editDistance(a, b) / longest <= 0.08;
+  const maxEdits = Math.min(MAX_NEAR_ECHO_EDITS, Math.floor(longest * NEAR_ECHO_RATIO));
+  if (a.length === 0 || b.length === 0) {
+    return { isEcho: false, operations: 0, maxEdits, skippedByLength: false };
+  }
+  if (a === b) {
+    return { isEcho: true, operations: 0, maxEdits, skippedByLength: false };
+  }
+  if (longest < 8 || Math.abs(a.length - b.length) > maxEdits) {
+    return { isEcho: false, operations: 0, maxEdits, skippedByLength: true };
+  }
+  const bounded = boundedEditDistanceWithin(a, b, maxEdits);
+  return {
+    isEcho: bounded.within,
+    operations: bounded.operations,
+    maxEdits,
+    skippedByLength: false,
+  };
 }
 
 function residualNonTargetRatio(output: string): number {
@@ -57,9 +104,11 @@ function residualNonTargetRatio(output: string): number {
  */
 export function isTranslationOutputRejected(source: string, output: string): boolean {
   const trimmed = output.trim();
-  if (TRANSLATION_META_REFUSAL_RE.test(trimmed.slice(0, 160))) return true;
+  const outputIsMetaRefusal = TRANSLATION_META_REFUSAL_RE.test(trimmed.slice(0, 160));
+  const sourceIsMetaRefusal = TRANSLATION_META_REFUSAL_RE.test(source.slice(0, 160));
+  if (outputIsMetaRefusal && !sourceIsMetaRefusal) return true;
   if (TASK_META_PREFIX_RE.test(trimmed)) return true;
-  if (isEchoOrNearEcho(source, trimmed)) return true;
+  if (compareTranslationEcho(source, trimmed).isEcho) return true;
 
   const ordinaryPrefix = ORDINARY_PREFIX_RE.test(trimmed);
   const sourceHasCodeIntent = !SOURCE_INJECTION_RE.test(source) && CODE_INTENT_RE.test(source);

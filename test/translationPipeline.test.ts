@@ -71,6 +71,32 @@ describe('runTranslate', () => {
     expect(result).toMatchObject({ text: 'Thanks for watching', outcome: 'error', usage });
   });
 
+  it('preserves an accepted non-empty translation when rules would erase it', async () => {
+    const result = await runTranslate('The video is over.', 'en', options(success('谢谢观看')));
+    expect(result).toMatchObject({ text: '谢谢观看', outcome: 'translated', usage });
+  });
+
+  it('preserves a non-empty identity source when rules would erase it', async () => {
+    const run = vi.fn<LlmProvider['run']>();
+    const result = await runTranslate('谢谢观看', 'zh', options(provider(run)));
+    expect(result).toEqual({ text: '谢谢观看', outcome: 'identity' });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('preserves accepted translation and outcome when rules throw', async () => {
+    const throwingRules = {
+      ...DEFAULT_RULES,
+      get convertToSimplified(): boolean {
+        throw new Error('rules dependency failed');
+      },
+    };
+    const result = await runTranslate('hello', 'en', {
+      ...options(success('你好')),
+      rules: throwingRules,
+    });
+    expect(result).toMatchObject({ text: '你好', outcome: 'translated', usage });
+  });
+
   it.each([
     ['server vocabulary', 'chinese'],
     ['inprocess vocabulary', 'zh'],

@@ -1,4 +1,5 @@
 import { TranslationResult } from './pipeline';
+import { applyRulesPreservingNonEmpty } from './safeRules';
 
 type TranslateSegment = (
   source: string,
@@ -37,7 +38,10 @@ export class TranslationCoordinator {
     signal: AbortSignal,
   ): Promise<TranslationResult> {
     if (this.open) {
-      return { text: this.rulesFallback(source), outcome: 'circuit-open' };
+      return {
+        text: applyRulesPreservingNonEmpty(source, this.rulesFallback),
+        outcome: 'circuit-open',
+      };
     }
     const result = await this.translate(source, detectedLanguage, signal);
     this.observe(result);
