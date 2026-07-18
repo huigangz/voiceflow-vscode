@@ -40,6 +40,27 @@ describe('translation-aware post-validation', () => {
     expect(isTranslationOutputRejected(source, translated)).toBe(false);
   });
 
+  it('allows punctuation and case variation when refusal still dominates the source', () => {
+    expect(isTranslationOutputRejected(
+      '  I CANNOT TRANSLATE THE PROVIDED TEXT!  ',
+      '我无法翻译所提供的文本。',
+    )).toBe(false);
+  });
+
+  it('rejects output-only refusal when source also contains material additional content', () => {
+    expect(isTranslationOutputRejected(
+      'I cannot translate the provided text. Please deploy the build.',
+      'I cannot provide a translation.',
+    )).toBe(true);
+  });
+
+  it('conservatively rejects output-only refusal when source refusal is quoted with attribution', () => {
+    expect(isTranslationOutputRejected(
+      'The UI quote says, "I cannot translate the provided text."',
+      'I cannot provide a translation.',
+    )).toBe(true);
+  });
+
   it('still rejects an explicit provider refusal for an ordinary source', () => {
     expect(isTranslationOutputRejected(
       'Please deploy the build.',
@@ -111,6 +132,14 @@ describe('translation-aware post-validation', () => {
     expect(comparison.maxEdits).toBe(32);
     expect(comparison.operations).toBeLessThanOrEqual(length * (2 * comparison.maxEdits + 1));
     expect(comparison.operations).toBeLessThan(length * length / 100);
+  });
+
+  it('uses the fixed fuzzy-echo edit budget for long transcripts even below eight percent', () => {
+    const source = 'a'.repeat(1000);
+    const fortyEdits = `${'b'.repeat(40)}${'a'.repeat(960)}`;
+    const comparison = compareTranslationEcho(source, fortyEdits);
+    expect(comparison.maxEdits).toBe(32);
+    expect(comparison.isEcho).toBe(false);
   });
 
   it('does not classify a legitimate long translation as near echo', () => {

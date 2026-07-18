@@ -16,8 +16,10 @@ function normalizedForEcho(text: string): string {
   return text.normalize('NFKC').toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
 }
 
-const NEAR_ECHO_RATIO = 0.08;
-const MAX_NEAR_ECHO_EDITS = 32;
+const FUZZY_ECHO_PERCENT_LIMIT = 0.08;
+const FUZZY_ECHO_MAX_EDIT_BUDGET = 32;
+const SOURCE_REFUSAL_MIN_DOMINANCE = 0.9;
+const SOURCE_REFUSAL_MAX_RESIDUAL_CHARS = 8;
 
 export interface TranslationEchoComparison {
   isEcho: boolean;
@@ -63,6 +65,10 @@ function boundedEditDistanceWithin(
   return { within: (previous.get(b.length) ?? outside) <= maxEdits, operations };
 }
 
+/**
+ * Bounded fuzzy-echo heuristic. The fixed 32-edit budget intentionally narrows the nominal 8%
+ * threshold on long transcripts to protect extension-host latency and avoid broad fuzzy rejection.
+ */
 export function compareTranslationEcho(
   source: string,
   output: string,
@@ -70,7 +76,10 @@ export function compareTranslationEcho(
   const a = normalizedForEcho(source);
   const b = normalizedForEcho(output);
   const longest = Math.max(a.length, b.length);
-  const maxEdits = Math.min(MAX_NEAR_ECHO_EDITS, Math.floor(longest * NEAR_ECHO_RATIO));
+  const maxEdits = Math.min(
+    FUZZY_ECHO_MAX_EDIT_BUDGET,
+    Math.floor(longest * FUZZY_ECHO_PERCENT_LIMIT),
+  );
   if (a.length === 0 || b.length === 0) {
     return { isEcho: false, operations: 0, maxEdits, skippedByLength: false };
   }
@@ -89,6 +98,24 @@ export function compareTranslationEcho(
   };
 }
 
+/**
+ * A source refusal suppresses the matching output signal only when its detected span accounts for
+ * at least 90% of normalized source content and leaves at most eight normalized residual chars.
+ * This admits punctuation/case variation while treating quoted or mixed material conservatively.
+ */
+function sourceRefusalDominates(source: string): boolean {
+  const match = TRANSLATION_META_REFUSAL_RE.exec(source.slice(0, 160));
+  if (!match) return false;
+  const normalizedSource = normalizedForEcho(source);
+  const normalizedSpan = normalizedForEcho(match[0]);
+  if (normalizedSource.length === 0 || normalizedSpan.length === 0) return false;
+  const residualChars = Math.max(0, normalizedSource.length - normalizedSpan.length);
+  return (
+    normalizedSpan.length / normalizedSource.length >= SOURCE_REFUSAL_MIN_DOMINANCE &&
+    residualChars <= SOURCE_REFUSAL_MAX_RESIDUAL_CHARS
+  );
+}
+
 function residualNonTargetRatio(output: string): number {
   const target = output.match(/\p{Script=Han}/gu)?.length ?? 0;
   const nonTarget = output.match(/[\p{Script=Latin}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu)?.length ?? 0;
@@ -105,8 +132,7 @@ function residualNonTargetRatio(output: string): number {
 export function isTranslationOutputRejected(source: string, output: string): boolean {
   const trimmed = output.trim();
   const outputIsMetaRefusal = TRANSLATION_META_REFUSAL_RE.test(trimmed.slice(0, 160));
-  const sourceIsMetaRefusal = TRANSLATION_META_REFUSAL_RE.test(source.slice(0, 160));
-  if (outputIsMetaRefusal && !sourceIsMetaRefusal) return true;
+  if (outputIsMetaRefusal && !sourceRefusalDominates(source)) return true;
   if (TASK_META_PREFIX_RE.test(trimmed)) return true;
   if (compareTranslationEcho(source, trimmed).isEcho) return true;
 
