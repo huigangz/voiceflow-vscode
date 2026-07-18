@@ -122,8 +122,15 @@ export function buildCliProbeInvocation(
   if (kind === 'codex-cli') {
     return {
       executable: 'codex',
-      // `--help` validates the complete local parser surface without sending a model request.
-      args: [...codexSafeExecArgs(context), '--help'],
+      // Local-only capability check: verifies both feature names and their effective false values.
+      args: [
+        '--disable',
+        'shell_tool',
+        '--disable',
+        'shell_snapshot',
+        'features',
+        'list',
+      ],
       cwd: context.neutralDirectory,
     };
   }
@@ -385,6 +392,19 @@ function classifyFailure(
   return { kind: 'error', message };
 }
 
+function codexShellFeaturesDisabled(stdout: string): boolean {
+  const expected = new Set(['shell_tool', 'shell_snapshot']);
+  const seen = new Set<string>();
+  for (const line of stdout.split(/\r?\n/u)) {
+    const fields = line.trim().split(/\s+/u);
+    const feature = fields[0];
+    if (feature === undefined || !expected.has(feature)) continue;
+    if (seen.has(feature) || fields.at(-1) !== 'false') return false;
+    seen.add(feature);
+  }
+  return seen.size === expected.size;
+}
+
 export function createCliProvider(
   kind: CliKind,
   context: CliExecutionContext,
@@ -413,7 +433,16 @@ export function createCliProvider(
           signal,
         );
         if (signal.aborted) return { ok: false, kind: 'aborted' };
-        if (result.ok) return { ok: true };
+        if (result.ok) {
+          if (kind !== 'codex-cli' || codexShellFeaturesDisabled(result.stdout)) {
+            return { ok: true };
+          }
+          return {
+            ok: false,
+            kind: 'unavailable',
+            message: 'Codex CLI did not confirm shell_tool=false and shell_snapshot=false.',
+          };
+        }
         const failure = classifyFailure(result, signal);
         if (kind === 'codex-cli' && failure.kind !== 'aborted') {
           return {

@@ -56,7 +56,8 @@ async function createNpmShimFixture(name: string): Promise<{
   await writeFile(
     cliPath,
     [
-      "if (process.argv.includes('__HANG__')) setInterval(() => {}, 30000);",
+      "if (process.argv.includes('features') && process.argv.includes('list')) process.stdout.write('shell_snapshot stable false\\nshell_tool stable false\\n');",
+      "else if (process.argv.includes('__HANG__')) setInterval(() => {}, 30000);",
       "else { let input = ''; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data', chunk => input += chunk);",
       "process.stdin.on('end', () => process.stdout.write(JSON.stringify({ args: process.argv.slice(2), input }))); }",
@@ -207,21 +208,12 @@ describe('buildCliInvocation', () => {
     expect(buildCliProbeInvocation('codex-cli', executionContext)).toEqual({
       executable: 'codex',
       args: [
-        'exec',
-        '--strict-config',
         '--disable',
         'shell_tool',
         '--disable',
         'shell_snapshot',
-        '--ephemeral',
-        '--ignore-user-config',
-        '--ignore-rules',
-        '--sandbox',
-        'read-only',
-        '--skip-git-repo-check',
-        '-C',
-        executionContext.neutralDirectory,
-        '--help',
+        'features',
+        'list',
       ],
       cwd: executionContext.neutralDirectory,
     });
@@ -337,7 +329,11 @@ describe('CLI LlmProvider', () => {
             stderr: '',
           };
         }
-        return { ok: true, stdout: 'codex-cli 1.0', stderr: '' };
+        return {
+          ok: true,
+          stdout: 'shell_snapshot stable false\nshell_tool stable false\n',
+          stderr: '',
+        };
       };
 
       await expect(
@@ -476,7 +472,10 @@ describe('CLI LlmProvider', () => {
     expect(result).toMatchObject({ ok: false, kind: 'aborted' });
   });
 
-  it('codex prepare fails closed when the local CLI rejects the shell-disabled exec probe', async () => {
+  it.each([
+    "error: unexpected argument '--disable'",
+    'Error: unknown feature: voiceflow_unknown_feature',
+  ])('codex prepare fails closed before capture when the feature probe reports %s', async (stderr) => {
     const calls: CliInvocation[] = [];
     const runner: CliCommandRunner = async (invocation) => {
       calls.push(invocation);
@@ -485,7 +484,7 @@ describe('CLI LlmProvider', () => {
         kind: 'exit',
         code: 2,
         stdout: '',
-        stderr: "error: unexpected argument '--disable'",
+        stderr,
       };
     };
 
@@ -521,6 +520,46 @@ describe('CLI LlmProvider', () => {
       kind: 'unavailable',
       message: expect.stringContaining('shell_tool'),
     });
+  });
+
+  it.each([
+    ['missing shell_snapshot', 'shell_tool stable false\n'],
+    ['shell_tool still true', 'shell_snapshot stable false\nshell_tool stable true\n'],
+    ['unknown feature rows only', 'voiceflow_unknown stable false\n'],
+  ])('codex prepare rejects feature output with %s', async (_case, stdout) => {
+    const runner: CliCommandRunner = async () => ({ ok: true, stdout, stderr: '' });
+
+    const result = await createCliProvider(
+      'codex-cli',
+      executionContext,
+      runner,
+      directResolver,
+    ).prepare(new AbortController().signal);
+
+    expect(result).toMatchObject({
+      ok: false,
+      kind: 'unavailable',
+      message: expect.stringContaining('false'),
+    });
+  });
+
+  it('codex prepare accepts exact false feature rows among unrelated output', async () => {
+    const runner: CliCommandRunner = async () => ({
+      ok: true,
+      stdout: [
+        'other_feature under development true',
+        'shell_snapshot stable false',
+        'shell_tool stable false',
+      ].join('\n'),
+      stderr: '',
+    });
+
+    await expect(createCliProvider(
+      'codex-cli',
+      executionContext,
+      runner,
+      directResolver,
+    ).prepare(new AbortController().signal)).resolves.toEqual({ ok: true });
   });
 
   it('never retries a failed codex invocation without shell_tool disabled', async () => {
