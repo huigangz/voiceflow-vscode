@@ -10,6 +10,7 @@ const CODE_INTENT_RE =
   /(?:```|~~~|`[^`]+`|https?:\/\/|\b(?:code(?:\s+block)?|const|let|var|function|class|interface|npm|JSON|Markdown)\b|[{}<>]=?|=>)/iu;
 const CODE_SHAPE_RE =
   /(?:`[^`]+`|https?:\/\/|\b(?:const|let|var|function|class|interface|npm|JSON)\b|[{}<>]=?|=>)/iu;
+const SOURCE_INJECTION_RE = /(?:<\/?transcript>|ignore (?:all )?(?:previous|prior) instructions)/iu;
 
 function normalizedForEcho(text: string): string {
   return text.normalize('NFKC').toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
@@ -61,9 +62,13 @@ export function isTranslationOutputRejected(source: string, output: string): boo
   if (isEchoOrNearEcho(source, trimmed)) return true;
 
   const ordinaryPrefix = ORDINARY_PREFIX_RE.test(trimmed);
-  const unexpectedFence = CODE_FENCE_RE.test(trimmed) && !CODE_INTENT_RE.test(source);
+  const sourceHasCodeIntent = !SOURCE_INJECTION_RE.test(source) && CODE_INTENT_RE.test(source);
+  const outputHasFence = CODE_FENCE_RE.test(trimmed);
+  const unexpectedFence = outputHasFence && !sourceHasCodeIntent;
   const contentWithoutFences = trimmed.replace(/```|~~~/gu, '');
-  const residual = !CODE_SHAPE_RE.test(contentWithoutFences) && residualNonTargetRatio(trimmed) > 0.7;
+  const outputHasCodeShape = outputHasFence || CODE_SHAPE_RE.test(contentWithoutFences);
+  const residualIsExpected = sourceHasCodeIntent && outputHasCodeShape;
+  const residual = !residualIsExpected && residualNonTargetRatio(trimmed) > 0.7;
   const weakSignals = Number(ordinaryPrefix) + Number(unexpectedFence) + Number(residual);
   const extremeExpansion =
     trimmed.length > source.length * 6 && trimmed.length > source.length + 200;

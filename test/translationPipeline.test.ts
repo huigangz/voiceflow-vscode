@@ -47,6 +47,30 @@ describe('runTranslate', () => {
     });
   });
 
+  it('calls the provider before rules can erase a non-empty hallucination-like English source', async () => {
+    const run = vi.fn<LlmProvider['run']>(async () => ({
+      ok: true,
+      text: '本期节目到此结束。',
+      usage,
+    }));
+
+    const result = await runTranslate('Thanks for watching', 'en', options(provider(run)));
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0]?.[1]).toBe('Thanks for watching');
+    expect(result).toMatchObject({ text: '本期节目到此结束。', outcome: 'translated' });
+  });
+
+  it('keeps a non-empty raw source insertable when provider failure fallback rules erase it', async () => {
+    const result = await runTranslate(
+      'Thanks for watching',
+      'en',
+      options(provider(async () => ({ ok: false, kind: 'unavailable', usage }))),
+    );
+
+    expect(result).toMatchObject({ text: 'Thanks for watching', outcome: 'error', usage });
+  });
+
   it.each([
     ['server vocabulary', 'chinese'],
     ['inprocess vocabulary', 'zh'],

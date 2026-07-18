@@ -69,14 +69,18 @@ export async function runTranslate(
   opts: TranslateOptions,
   outerSignal?: AbortSignal,
 ): Promise<TranslationResult> {
-  let fallback = source;
+  const rawFallback = source.trim();
+  let fallback = rawFallback;
+  const rulesFallback = (): string => {
+    const ruled = applyRules(source, opts.rules);
+    return ruled.length > 0 ? ruled : rawFallback;
+  };
   try {
     if (outerSignal?.aborted) throw new CleanupCancelled();
-    fallback = applyRules(source, opts.rules);
     if (normalizeDetectedLanguage(detectedLanguage) === 'zh') {
-      return { text: fallback, outcome: 'identity' };
+      return { text: applyRules(source, opts.rules), outcome: 'identity' };
     }
-    if (fallback.length === 0) return { text: fallback, outcome: 'empty' };
+    if (rawFallback.length === 0) return { text: '', outcome: 'empty' };
 
     const controller = new AbortController();
     let resolveOuterAbort: (() => void) | undefined;
@@ -110,6 +114,7 @@ export async function runTranslate(
       const settled = await Promise.race([provider, timeout, outerAbort]);
       if (settled.kind === 'outer-abort' || outerSignal?.aborted) throw new CleanupCancelled();
       if (settled.kind === 'timeout') {
+        fallback = rulesFallback();
         safeLog(opts.log, `[translate] ${opts.provider.name} timeout(${Date.now() - startedAt}ms) -> source fallback`);
         return {
           text: fallback,
@@ -124,6 +129,7 @@ export async function runTranslate(
       const providerResult = settled.result;
       if (outerSignal?.aborted) throw new CleanupCancelled();
       if (!providerResult.ok) {
+        fallback = rulesFallback();
         if (timeoutFired) {
           return { text: fallback, outcome: 'timeout', provider: opts.provider.name, llmMs: elapsed, usage: providerResult.usage };
         }
@@ -144,9 +150,11 @@ export async function runTranslate(
 
       const translated = stripEchoedWrapper(providerResult.text);
       if (translated.length === 0) {
+        fallback = rulesFallback();
         return { text: fallback, outcome: 'empty', provider: opts.provider.name, llmMs: elapsed, usage: providerResult.usage };
       }
       if (isTranslationOutputRejected(source, translated)) {
+        fallback = rulesFallback();
         return { text: fallback, outcome: 'rejected', provider: opts.provider.name, llmMs: elapsed, usage: providerResult.usage };
       }
       return {
@@ -162,6 +170,11 @@ export async function runTranslate(
     }
   } catch (error) {
     if (error instanceof CleanupCancelled || outerSignal?.aborted) throw new CleanupCancelled();
+    try {
+      fallback = rulesFallback();
+    } catch {
+      // Preserve the raw non-empty segment if the deterministic dependency itself failed.
+    }
     safeLog(opts.log, `[translate] ${opts.provider.name} unexpected error: ${String(error).slice(0, 200)} -> source fallback`);
     return { text: fallback, outcome: 'error', provider: opts.provider.name };
   }
