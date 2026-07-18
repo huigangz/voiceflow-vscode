@@ -7,6 +7,8 @@
  * - 子进程管道按 utf8 读写,正文走 stdin
  */
 import { spawn } from 'node:child_process';
+import { access, readFile } from 'node:fs/promises';
+import { dirname, extname, join } from 'node:path';
 import {
   LlmProvider,
   PrepareResult,
@@ -23,6 +25,20 @@ export interface CliInvocation {
   args: readonly string[];
 }
 
+export interface CliLaunchSpec {
+  executable: string;
+  prefixArgs: readonly string[];
+}
+
+export type CliResolutionResult =
+  | { ok: true; launch: CliLaunchSpec }
+  | { ok: false; kind: 'unavailable' | 'aborted' | 'error'; message?: string };
+
+export type CliResolver = (
+  kind: CliKind,
+  signal: AbortSignal,
+) => Promise<CliResolutionResult>;
+
 /** Each instruction occupies one argv element; transcript data is carried separately on stdin. */
 export function buildCliInvocation(kind: CliKind, instruction: string): CliInvocation {
   switch (kind) {
@@ -38,6 +54,10 @@ export function buildCliProbeInvocation(kind: CliKind): CliInvocation {
     executable: kind === 'claude-cli' ? 'claude' : 'codex',
     args: ['--version'],
   };
+}
+
+function invocationForLaunch(launch: CliLaunchSpec, args: readonly string[]): CliInvocation {
+  return { executable: launch.executable, args: [...launch.prefixArgs, ...args] };
 }
 
 export type CliExecutionResult =
@@ -106,6 +126,85 @@ export function runCliCommand(
   });
 }
 
+/** Resolve Windows npm shims without ever passing caller text through cmd.exe. */
+export async function resolveCliLaunch(
+  kind: CliKind,
+  signal: AbortSignal,
+  runCommand: CliCommandRunner = runCliCommand,
+  platform: NodeJS.Platform = process.platform,
+): Promise<CliResolutionResult> {
+  const executable = kind === 'claude-cli' ? 'claude' : 'codex';
+  if (signal.aborted) return { ok: false, kind: 'aborted' };
+  if (platform !== 'win32') {
+    return { ok: true, launch: { executable, prefixArgs: [] } };
+  }
+
+  let result: CliExecutionResult;
+  try {
+    result = await runCommand({ executable: 'where.exe', args: [executable] }, '', signal);
+  } catch (error) {
+    return {
+      ok: false,
+      kind: signal.aborted ? 'aborted' : 'error',
+      message: String(error),
+    };
+  }
+  if (signal.aborted || (!result.ok && result.kind === 'aborted')) {
+    return { ok: false, kind: 'aborted' };
+  }
+  if (!result.ok) {
+    return {
+      ok: false,
+      kind: result.kind === 'exit' ? 'unavailable' : 'error',
+      message: result.message ?? result.stderr,
+    };
+  }
+
+  const candidates = result.stdout
+    .split(/\r?\n/u)
+    .map((candidate) => candidate.trim())
+    .filter((candidate) => candidate.length > 0);
+  const native = candidates.find((candidate) => /\.(?:exe|com)$/iu.test(candidate));
+  if (native !== undefined) return { ok: true, launch: { executable: native, prefixArgs: [] } };
+
+  for (const candidate of candidates) {
+    if (extname(candidate).toLowerCase() !== '.cmd') continue;
+    const ps1Path = `${candidate.slice(0, -4)}.ps1`;
+    try {
+      const ps1 = await readFile(ps1Path, 'utf8');
+      const relativeTarget = ps1.match(
+        /["']\$basedir[\\/](?<target>[^"'\r\n]+\.[cm]?js)["']\s+\$args/iu,
+      )?.groups?.target;
+      if (relativeTarget === undefined) continue;
+      const targetPath = join(dirname(ps1Path), ...relativeTarget.split(/[\\/]/u));
+      await access(targetPath);
+      const siblingNode = join(dirname(ps1Path), 'node.exe');
+      let nodeExecutable = 'node.exe';
+      try {
+        await access(siblingNode);
+        nodeExecutable = siblingNode;
+      } catch {
+        // npm's standard fallback is node.exe from PATH.
+      }
+      return {
+        ok: true,
+        launch: {
+          executable: nodeExecutable,
+          prefixArgs: [targetPath],
+        },
+      };
+    } catch {
+      // Try the next candidate; unsafe cmd.exe fallback is intentionally forbidden.
+    }
+  }
+
+  return {
+    ok: false,
+    kind: 'unavailable',
+    message: `No safe executable or PowerShell companion found for ${executable}.`,
+  };
+}
+
 function estimatedUsage(instruction: string, wrappedText: string, output?: string): TokenUsage {
   return {
     inputTokens: instruction.length + wrappedText.length,
@@ -144,13 +243,28 @@ function classifyFailure(
 export function createCliProvider(
   kind: CliKind,
   runCommand: CliCommandRunner = runCliCommand,
+  resolver: CliResolver = (selectedKind, signal) =>
+    resolveCliLaunch(selectedKind, signal, runCommand),
 ): LlmProvider {
+  let launch: CliLaunchSpec | undefined;
+  const ensureLaunch = async (signal: AbortSignal): Promise<CliResolutionResult> => {
+    if (launch !== undefined) return { ok: true, launch };
+    const resolution = await resolver(kind, signal);
+    if (resolution.ok) launch = resolution.launch;
+    return resolution;
+  };
   return {
     name: kind,
     async prepare(signal): Promise<PrepareResult> {
       if (signal.aborted) return { ok: false, kind: 'aborted' };
       try {
-        const result = await runCommand(buildCliProbeInvocation(kind), '', signal);
+        const resolution = await ensureLaunch(signal);
+        if (!resolution.ok) return resolution;
+        const result = await runCommand(
+          invocationForLaunch(resolution.launch, buildCliProbeInvocation(kind).args),
+          '',
+          signal,
+        );
         if (signal.aborted) return { ok: false, kind: 'aborted' };
         if (result.ok) return { ok: true };
         const failure = classifyFailure(result, signal);
@@ -168,8 +282,10 @@ export function createCliProvider(
       const inputUsage = estimatedUsage(instruction, wrappedText);
       if (signal.aborted) return { ok: false, kind: 'aborted', usage: inputUsage };
       try {
+        const resolution = await ensureLaunch(signal);
+        if (!resolution.ok) return { ...resolution, usage: inputUsage };
         const result = await runCommand(
-          buildCliInvocation(kind, instruction),
+          invocationForLaunch(resolution.launch, buildCliInvocation(kind, instruction).args),
           wrappedText,
           signal,
         );
