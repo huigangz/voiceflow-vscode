@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Session } from '../src/session';
+import { Session, toggleActionForSession } from '../src/session';
 
 describe('Session 状态机 (spec §5.3)', () => {
   it('正常闭环: idle → preparing → recording → transcribing → cleaning → inserting → idle', () => {
@@ -98,5 +98,21 @@ describe('Session 状态机 (spec §5.3)', () => {
     s.dispatch('cancel');
     expect(s.active).toBe(false);
     expect(seen).toEqual(['idle>preparing', 'preparing>recording', 'recording>idle']);
+  });
+
+  it('toggle command keeps preparing single-flight but cancels an early-committed recording startup', () => {
+    const preparing = new Session();
+    preparing.dispatch('prepare');
+    let cancellations = 0;
+    if (toggleActionForSession(preparing.state, true) === 'cancel-startup') cancellations++;
+    expect(toggleActionForSession(preparing.state, true)).toBe('none');
+    expect(cancellations).toBe(0);
+    expect(preparing.state).toBe('preparing');
+
+    const recording = new Session();
+    recording.dispatch('prepare');
+    recording.dispatch('start');
+    expect(toggleActionForSession(recording.state, true)).toBe('cancel-startup');
+    expect(toggleActionForSession(recording.state, false)).toBe('stop-recording');
   });
 });

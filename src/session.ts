@@ -19,6 +19,18 @@ export type SessionState =
   | 'inserting'
   | 'draining';
 
+export type ToggleAction = 'start' | 'cancel-startup' | 'stop-recording' | 'none';
+
+export function toggleActionForSession(
+  state: SessionState,
+  startupActive: boolean,
+): ToggleAction {
+  if (state === 'idle') return 'start';
+  if (state === 'preparing') return 'none';
+  if (state === 'recording') return startupActive ? 'cancel-startup' : 'stop-recording';
+  return 'none';
+}
+
 export type SessionEvent =
   | 'prepare'      // Ctrl+Alt+L,仅 idle 时有效
   | 'start'        // preflight 完成,仅 preparing 时有效

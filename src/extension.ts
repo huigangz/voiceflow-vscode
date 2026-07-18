@@ -3,7 +3,7 @@
  * Phase 0 — 已接入:S1 录音(Step 1)。待接入:whisper(Step 2)、插入(Step 3+)。
  */
 import * as vscode from 'vscode';
-import { Session } from './session';
+import { Session, toggleActionForSession } from './session';
 // WebviewRecorder 源码保留但运行时不可达(webview 无麦克风权限,microsoft/vscode#250568);
 // 不再 import,避免打包无用代码。
 import { HelperRecorder } from './audio/helperRecorder';
@@ -279,15 +279,20 @@ async function getWhisper(): Promise<EngineManager> {
 }
 
 async function toggleDictation(args?: { focus?: FocusHint }): Promise<void> {
-  if (session.state === 'idle') {
-    await startRecording(args?.focus);
-  } else if (cancelStartingSession('toggle')) {
-    return;
-  } else if (session.state === 'recording') {
-    if (segmented) await stopSegmentedSession('toggle');
-    else await stopRecordingAndProcess('toggle');
+  switch (toggleActionForSession(session.state, sessionPreflight.active)) {
+    case 'start':
+      await startRecording(args?.focus);
+      return;
+    case 'cancel-startup':
+      cancelStartingSession('toggle');
+      return;
+    case 'stop-recording':
+      if (segmented) await stopSegmentedSession('toggle');
+      else await stopRecordingAndProcess('toggle');
+      return;
+    case 'none':
+      return;
   }
-  // 其他无 startup 的阶段(含 draining):toggle 无效(取消走 Esc,spec §5.3)
 }
 
 /** P2a:按配置与运行期回退状态选录音后端。webview 路线已 No-Go(microsoft/vscode#250568),不在枚举内。 */
@@ -451,9 +456,9 @@ async function startBatchSession(
     const result = await runCancellableStartup(
       sessionPreflight,
       (signal) => admitBatchSession(snapshot, signal),
-      async (prepared, signal) => {
+      async (prepared, signal, frozenTarget) => {
         // F4:插入目标在录音开始时锁定
-        insertTarget = captureTarget(focusHint);
+        insertTarget = frozenTarget;
         log(`[dictation] target locked: ${insertTarget.kind}`);
         if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
         const controller = await startWithRecorderFallback(
@@ -470,6 +475,7 @@ async function startBatchSession(
           controllerOwner.dispose();
           disposeFocusedInputTracker();
         },
+        captureBeforeAdmission: () => captureTarget(focusHint),
       },
     );
     if (!result.started) return;

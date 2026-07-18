@@ -75,10 +75,12 @@ describe('翻译 preflight 编排(t2a)', () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const first = preflight.run(async () => { await gate; return 'ready'; });
     expect(session.state).toBe('preparing');
+    expect(preflight.active).toBe(true);
     await expect(preflight.run(async () => 'duplicate')).resolves.toEqual({ started: false, reason: 'busy' });
     release();
     await expect(first).resolves.toEqual({ started: true, value: 'ready' });
     expect(session.state).toBe('recording');
+    expect(preflight.active).toBe(false);
   });
 
   it('Esc 取消等待回 idle;共享启动继续,晚到结果不进入 recording', async () => {
@@ -195,6 +197,36 @@ describe('翻译 preflight 编排(t2a)', () => {
     release();
     await expect(startup).resolves.toMatchObject({ started: true });
     expect(session.state).toBe('recording');
+  });
+
+  it('freezes batch insertion target synchronously before deferred admission settles', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let releaseAdmission!: () => void;
+    const admission = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    let source = 'initial-focus';
+    let captures = 0;
+    const startup = runCancellableStartup(
+      preflight,
+      async () => { await admission; return 'admitted'; },
+      async (_admitted, _signal, frozenTarget) => frozenTarget,
+      () => {},
+      {
+        commitImmediately: true,
+        captureBeforeAdmission: () => {
+          captures++;
+          return source;
+        },
+      },
+    );
+
+    expect(captures).toBe(1);
+    expect(session.state).toBe('recording');
+    source = 'later-focus';
+    releaseAdmission();
+
+    await expect(startup).resolves.toEqual({ started: true, value: 'initial-focus' });
+    expect(captures).toBe(1);
   });
 });
 

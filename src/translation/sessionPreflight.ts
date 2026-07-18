@@ -160,13 +160,15 @@ export async function startCancellableFallback<T extends { start(): Promise<void
  * Keep one preflight generation across asynchronous admission and recorder startup.
  * Cancellation abandons admission before capture; a resource produced late is disposed exactly once.
  */
-export async function runCancellableStartup<A, R>(
+export async function runCancellableStartup<A, R, C = undefined>(
   preflight: SessionPreflight,
   admit: (signal: AbortSignal) => Promise<A>,
-  start: (admission: A, signal: AbortSignal) => Promise<R>,
+  start: (admission: A, signal: AbortSignal, captured: C) => Promise<R>,
   disposeLate: (resource: R) => void,
-  options: SessionPreflightOptions = {},
+  options: SessionPreflightOptions & { captureBeforeAdmission?: () => C } = {},
 ): Promise<SessionPreflightResult<R>> {
+  let captured!: C;
+  if (options.captureBeforeAdmission) captured = options.captureBeforeAdmission();
   let resource: R | undefined;
   let disposed = false;
   const dispose = (value: R): void => {
@@ -177,7 +179,7 @@ export async function runCancellableStartup<A, R>(
   const result = await preflight.run(async (signal) => {
     const admission = await admit(signal);
     if (signal.aborted) throw new Error('startup cancelled after admission');
-    resource = await start(admission, signal);
+    resource = await start(admission, signal, captured);
     if (signal.aborted) {
       dispose(resource);
       throw new Error('startup cancelled after recorder start');
@@ -194,6 +196,10 @@ export class SessionPreflight {
   private current: { controller: AbortController; onCancel: (() => void) | undefined } | undefined;
 
   constructor(private readonly session: Session) {}
+
+  get active(): boolean {
+    return this.current !== undefined;
+  }
 
   async run<T>(
     work: (signal: AbortSignal) => Promise<T>,
