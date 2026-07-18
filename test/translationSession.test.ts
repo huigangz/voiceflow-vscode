@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Session } from '../src/session';
 import {
   MutableStartupResource,
+  prepareTranslationSnapshot,
   SessionPreflight,
   TranslationUnsupportedError,
   createTranslationSessionSnapshot,
@@ -235,6 +236,149 @@ describe('翻译 preflight 编排(t2a)', () => {
 
     await expect(startup).resolves.toEqual({ started: true, value: 'initial-focus' });
     expect(captures).toBe(1);
+  });
+});
+
+describe('target=zh language detection', () => {
+  it('forces per-call auto detection even when the frozen source hint is explicit', () => {
+    const explicit = createTranslationSessionSnapshot({ ...snapshot('zh'), sourceHint: 'en' });
+    expect(languageHintForSession(explicit, undefined)).toBe('auto');
+    expect(languageHintForSession(explicit, 'zh')).toBe('auto');
+  });
+});
+
+describe('target=zh provider preflight', () => {
+  it('rejects useLlm=false before engine or provider access', async () => {
+    const selectProvider = vi.fn();
+    const resolveCapabilities = vi.fn();
+    await expect(prepareTranslationSnapshot(
+      snapshot('zh'), resolveCapabilities, selectProvider, new AbortController().signal,
+    )).rejects.toThrow(/voiceflow\.translate\.useLlm.*transcript text.*external/i);
+    expect(selectProvider).not.toHaveBeenCalled();
+    expect(resolveCapabilities).not.toHaveBeenCalled();
+  });
+
+  it('rejects rules-only or unavailable provider before capture', async () => {
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    await expect(prepareTranslationSnapshot(
+      base, vi.fn(), async () => undefined, new AbortController().signal,
+    )).rejects.toThrow(/provider.*unavailable/i);
+  });
+
+  it('prepares one selected provider and freezes that instance into the session', async () => {
+    const calls: string[] = [];
+    const provider = {
+      name: 'frozen-provider',
+      prepare: vi.fn(async () => { calls.push('prepare'); return { ok: true as const }; }),
+      run: vi.fn(),
+    };
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    const prepared = await prepareTranslationSnapshot(
+      base,
+      vi.fn(),
+      async () => { calls.push('select'); return provider; },
+      new AbortController().signal,
+    );
+    expect(calls).toEqual(['select', 'prepare']);
+    expect(prepared.provider).toBe(provider);
+    expect(Object.isFrozen(prepared)).toBe(true);
+  });
+
+  it('reports authorization usage only when prepare made a metered request', async () => {
+    const authorizationUsage = vi.fn();
+    const usage = { inputTokens: 2, outputTokens: 1, estimate: false } as const;
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    const withPing = {
+      name: 'ping', prepare: async () => ({ ok: true as const, usage }), run: vi.fn(),
+    };
+    await prepareTranslationSnapshot(
+      base, vi.fn(), async () => withPing, new AbortController().signal, authorizationUsage,
+    );
+    expect(authorizationUsage).toHaveBeenCalledOnce();
+    expect(authorizationUsage).toHaveBeenCalledWith(usage);
+
+    await prepareTranslationSnapshot(
+      base,
+      vi.fn(),
+      async () => ({ ...withPing, prepare: async () => ({ ok: true as const }) }),
+      new AbortController().signal,
+      authorizationUsage,
+    );
+    expect(authorizationUsage).toHaveBeenCalledOnce();
+  });
+
+  it('reports authorization ping usage even when prepare rejects the session', async () => {
+    const authorizationUsage = vi.fn();
+    const usage = { inputTokens: 2, outputTokens: 1, estimate: false } as const;
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    await expect(prepareTranslationSnapshot(
+      base,
+      vi.fn(),
+      async () => ({
+        name: 'denied',
+        prepare: async () => ({ ok: false as const, kind: 'unavailable' as const, usage }),
+        run: vi.fn(),
+      }),
+      new AbortController().signal,
+      authorizationUsage,
+    )).rejects.toThrow(/denied/);
+    expect(authorizationUsage).toHaveBeenCalledOnce();
+    expect(authorizationUsage).toHaveBeenCalledWith(usage);
+  });
+
+  it('contains provider prepare throws and reports prepare failures clearly', async () => {
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    const thrown = { name: 'broken', prepare: async () => { throw new Error('prepare bug'); }, run: vi.fn() };
+    await expect(prepareTranslationSnapshot(
+      base, vi.fn(), async () => thrown, new AbortController().signal,
+    )).rejects.toThrow(/broken.*prepare bug/i);
+
+    const failed = {
+      name: 'offline',
+      prepare: async () => ({ ok: false as const, kind: 'unavailable' as const, message: 'not signed in' }),
+      run: vi.fn(),
+    };
+    await expect(prepareTranslationSnapshot(
+      base, vi.fn(), async () => failed, new AbortController().signal,
+    )).rejects.toThrow(/offline.*not signed in/i);
+  });
+
+  it('treats prepare aborted as cancellation only when the session signal is aborted', async () => {
+    const base = createTranslationSessionSnapshot({ ...snapshot('zh'), useLlm: true });
+    const controller = new AbortController();
+    const provider = {
+      name: 'cancelled',
+      prepare: async () => {
+        controller.abort();
+        return { ok: false as const, kind: 'aborted' as const };
+      },
+      run: vi.fn(),
+    };
+    await expect(prepareTranslationSnapshot(
+      base, vi.fn(), async () => provider, controller.signal,
+    )).rejects.toMatchObject({ name: 'CleanupCancelled' });
+
+    await expect(prepareTranslationSnapshot(
+      base,
+      vi.fn(),
+      async () => ({ ...provider, prepare: async () => ({ ok: false as const, kind: 'aborted' as const }) }),
+      new AbortController().signal,
+    )).rejects.toThrow(/cancelled.*aborted/i);
+  });
+
+  it.each(['off', 'en'] as const)('target=%s never selects or prepares an LLM provider', async (target) => {
+    const selectProvider = vi.fn();
+    const resolveCapabilities = vi.fn(async () => ({
+      engine: 'server' as const,
+      model: 'small',
+      canTranslateToEn: true,
+    }));
+    const prepared = await prepareTranslationSnapshot(
+      snapshot(target), resolveCapabilities, selectProvider, new AbortController().signal,
+    );
+    expect(selectProvider).not.toHaveBeenCalled();
+    expect(prepared.provider).toBeUndefined();
+    expect(resolveCapabilities).toHaveBeenCalledTimes(target === 'en' ? 1 : 0);
   });
 });
 

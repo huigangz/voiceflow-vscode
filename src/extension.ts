@@ -59,8 +59,22 @@ import {
   runCancellableStartup,
   startCancellableFallback,
   transcribeOptionsForSession,
-  validateTranslationSnapshot,
+  prepareTranslationSnapshot,
 } from './translation/sessionPreflight';
+import { runTranslate, TranslationResult } from './translation/pipeline';
+import { TranslationCoordinator } from './translation/coordinator';
+import { TranslationSessionFeedback } from './translation/feedback';
+import { TranslationSessionMetrics } from './translation/metrics';
+import { maybeShowTranslationPrivacyNotice } from './translation/privacyNotice';
+import {
+  EMPTY_TRANSLATION_USAGE,
+  TranslationUsageStore,
+  TranslationUsageTotals,
+  addUsage,
+  formatSessionUsage,
+  formatTranslationUsageReport,
+  recordRequest,
+} from './translation/usage';
 
 let output: vscode.OutputChannel;
 let session: Session;
@@ -74,9 +88,19 @@ let sttAbort: AbortController | undefined;
 let cleaningAbort: AbortController | undefined;
 let statusBar: StatusBar;
 let sessionPreflight: SessionPreflight;
+let translationUsageStore: TranslationUsageStore;
+interface SessionUsageAccounting {
+  snapshot(): TranslationUsageTotals;
+  translationStarted(): void;
+  translationUsage(usage: import('./cleanup/llmProvider').TokenUsage): void;
+  authorizationUsage(usage: import('./cleanup/llmProvider').TokenUsage): void;
+}
 interface PreparedSession {
   snapshot: TranslationSessionSnapshot;
   runner: EngineManager | undefined;
+  usage: SessionUsageAccounting;
+  feedback: TranslationSessionFeedback;
+  metrics: TranslationSessionMetrics;
 }
 let preparedSession: PreparedSession | undefined;
 /**
@@ -95,7 +119,8 @@ interface SegmentedSession {
   releaseLease: (() => void) | undefined;
   pending: number;
   stopping: boolean;
-  translation: TranslationSessionSnapshot;
+  prepared: PreparedSession;
+  metricsLogged: boolean;
   disposed: boolean;
 }
 let segmented: SegmentedSession | undefined;
@@ -144,11 +169,41 @@ function log(line: string): void {
   output.appendLine(`${new Date().toISOString().slice(11, 23)} ${line}`);
 }
 
+function createSessionUsageAccounting(): SessionUsageAccounting {
+  let totals = {
+    translationCalls: { ...EMPTY_TRANSLATION_USAGE.translationCalls },
+    authorizationCalls: { ...EMPTY_TRANSLATION_USAGE.authorizationCalls },
+  };
+  return {
+    snapshot: () => totals,
+    translationStarted: () => {
+      totals = recordRequest(totals, 'translationCalls');
+      translationUsageStore.recordRequest('translationCalls');
+    },
+    translationUsage: (usage) => {
+      totals = addUsage(totals, 'translationCalls', usage);
+      translationUsageStore.addUsage('translationCalls', usage);
+      if (!session.active) log(formatSessionUsage(totals));
+    },
+    authorizationUsage: (usage) => {
+      totals = recordRequest(totals, 'authorizationCalls', usage);
+      translationUsageStore.recordRequest('authorizationCalls', usage);
+    },
+  };
+}
+
+function showTranslationUsage(): void {
+  output.appendLine(formatTranslationUsageReport(translationUsageStore.snapshot()));
+  output.show();
+  void vscode.window.showInformationMessage('VoiceFlow: cumulative translation usage is shown in the VoiceFlow Output channel.');
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   extContext = context;
   output = vscode.window.createOutputChannel('VoiceFlow');
   session = new Session();
   sessionPreflight = new SessionPreflight(session);
+  translationUsageStore = new TranslationUsageStore(context.globalState);
 
   statusBar = new StatusBar();
   statusBar.setConfiguredTranslationTarget(
@@ -186,6 +241,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('voiceflow.toggleDictation', toggleDictation),
     vscode.commands.registerCommand('voiceflow.cancelSession', cancelSession),
     vscode.commands.registerCommand('voiceflow.showLogs', () => output.show()),
+    vscode.commands.registerCommand('voiceflow.showTranslationUsage', showTranslationUsage),
     vscode.commands.registerCommand('voiceflow.dictateSystemAudio', dictateSystemAudio),
     vscode.commands.registerCommand('voiceflow.downloadModel', () => modelManager.pickAndDownload()),
     vscode.commands.registerCommand('voiceflow.importModel', () => modelManager.pickAndImport()),
@@ -434,17 +490,34 @@ function captureTranslationSnapshot(cfg: vscode.WorkspaceConfiguration): Transla
 /** Resolve translation admission without ending the startup generation before recorder readiness. */
 async function admitBatchSession(
   snapshot: TranslationSessionSnapshot,
+  providerPolicy: string,
+  usage: SessionUsageAccounting,
   signal: AbortSignal,
 ): Promise<PreparedSession> {
-  if (snapshot.target === 'off') return { snapshot, runner: undefined };
   let resolvedRunner: EngineManager | undefined;
-  await validateTranslationSnapshot(snapshot, {
-    resolveCapabilities: async () => {
+  const preparedSnapshot = await prepareTranslationSnapshot(
+    snapshot,
+    async () => {
       resolvedRunner = await getWhisper();
       return resolvedRunner.resolveCapabilities();
     },
-  }, signal);
-  return { snapshot, runner: resolvedRunner };
+    () => pickEnhancer(providerPolicy),
+    signal,
+    (authorizationUsage) => usage.authorizationUsage(authorizationUsage),
+  );
+  if (preparedSnapshot.target === 'zh') {
+    maybeShowTranslationPrivacyNotice(
+      extContext.globalState,
+      (message) => vscode.window.showInformationMessage(message),
+    );
+  }
+  return {
+    snapshot: preparedSnapshot,
+    runner: resolvedRunner,
+    usage,
+    feedback: new TranslationSessionFeedback(),
+    metrics: new TranslationSessionMetrics(),
+  };
 }
 
 async function startBatchSession(
@@ -452,6 +525,8 @@ async function startBatchSession(
   focusHint: FocusHint,
 ): Promise<void> {
   const snapshot = captureTranslationSnapshot(cfg);
+  const providerPolicy = cfg.get<string>('cleanup.provider', 'auto');
+  const usage = createSessionUsageAccounting();
   statusBar.setTranslationTarget(snapshot.target);
   const controllerOwner = new MutableStartupResource<RecordingController>((controller) => {
     controller.cancel();
@@ -460,7 +535,7 @@ async function startBatchSession(
   try {
     const result = await runCancellableStartup(
       sessionPreflight,
-      (signal) => admitBatchSession(snapshot, signal),
+      (signal) => admitBatchSession(snapshot, providerPolicy, usage, signal),
       async (prepared, signal, frozenTarget) => {
         // F4:插入目标在录音开始时锁定
         insertTarget = frozenTarget;
@@ -556,18 +631,30 @@ async function startSegmentedSession(
     return;
   }
   const snapshot = captureTranslationSnapshot(cfg);
+  const providerPolicy = cfg.get<string>('cleanup.provider', 'auto');
+  const usage = createSessionUsageAccounting();
   statusBar.setTranslationTarget(snapshot.target);
   let resolvedRunner: EngineManager | undefined;
   try {
     const result = await runCancellableStartup(
       sessionPreflight,
       async (signal) => {
-        await validateTranslationSnapshot(snapshot, {
-          resolveCapabilities: async () => {
+        const preparedSnapshot = await prepareTranslationSnapshot(
+          snapshot,
+          async () => {
             resolvedRunner = await getWhisper();
             return resolvedRunner.resolveCapabilities();
           },
-        }, signal);
+          () => pickEnhancer(providerPolicy),
+          signal,
+          (authorizationUsage) => usage.authorizationUsage(authorizationUsage),
+        );
+        if (preparedSnapshot.target === 'zh') {
+          maybeShowTranslationPrivacyNotice(
+            extContext.globalState,
+            (message) => vscode.window.showInformationMessage(message),
+          );
+        }
         if (signal.aborted) throw new Error('segmented admission cancelled');
         // ② 形态准入属于同一可取消代际;off 虽已同步显示 recording,Esc 仍阻止晚到采集。
         const binaryDir = whisperBinaryDir(cfg);
@@ -582,7 +669,13 @@ async function startSegmentedSession(
             'Segmented mode requires the whisper server or in-process engine. Restore whisper-server.exe or use batch mode.',
           );
         }
-        return { snapshot, runner: resolvedRunner };
+        return {
+          snapshot: preparedSnapshot,
+          runner: resolvedRunner,
+          usage,
+          feedback: new TranslationSessionFeedback(),
+          metrics: new TranslationSessionMetrics(),
+        };
       },
       (prepared, signal) => startSegmentedCapture(
         cfg,
@@ -649,7 +742,8 @@ async function startSegmentedCapture(
     releaseLease: undefined,
     pending: 0,
     stopping: false,
-    translation: prepared.snapshot,
+    prepared,
+    metricsLogged: false,
     disposed: false,
   };
   warmup.then(
@@ -661,6 +755,38 @@ async function startSegmentedCapture(
   );
 
   const rulesCfg = prepared.snapshot.rules as RulesConfig;
+  if (prepared.snapshot.target === 'zh' && prepared.snapshot.provider === undefined) {
+    throw new TranslationUnsupportedError('The frozen LLM translation provider is unavailable.');
+  }
+  const coordinator = prepared.snapshot.target === 'zh'
+    ? new TranslationCoordinator(
+        (source, detectedLanguage, segmentSignal) => runTranslate(
+          source,
+          detectedLanguage,
+          {
+            rules: rulesCfg,
+            timeoutMs: prepared.snapshot.timeoutMs,
+            provider: prepared.snapshot.provider!,
+            log,
+            onRequestStart: () => prepared.usage.translationStarted(),
+            onUsage: (usage) => prepared.usage.translationUsage(usage),
+          },
+          segmentSignal,
+        ),
+        (source) => applyRules(source, rulesCfg),
+      )
+    : undefined;
+  const notifyTranslationResult = (result: TranslationResult, segmentIndex?: number): void => {
+    const fallback = ['timeout', 'error', 'empty', 'rejected', 'circuit-open'].includes(result.outcome);
+    log(`[translation]${segmentIndex === undefined ? '' : ` segment #${segmentIndex}`} ${result.outcome}` +
+      (fallback ? ' — inserted original' : ''));
+    const notice = prepared.feedback.notificationFor(result);
+    if (notice !== undefined) void vscode.window.showWarningMessage(notice);
+    if (coordinator?.isOpen && result.outcome !== 'circuit-open') {
+      const circuitNotice = prepared.feedback.notificationFor({ text: result.text, outcome: 'circuit-open' });
+      if (circuitNotice !== undefined) void vscode.window.showWarningMessage(circuitNotice);
+    }
+  };
   const baseLanguage = prepared.snapshot.sourceHint;
   let lockedLanguage: 'zh' | 'en' | undefined;
   let firstSegmentDone = false;
@@ -698,7 +824,9 @@ async function startSegmentedCapture(
         decodeLanguageHint,
       };
     },
-    cleanup: async (raw) => ({ text: applyRules(raw, rulesCfg), outcome: 'rules-only' }),
+    cleanup: async (raw, detectedLanguage, segmentSignal) => coordinator === undefined
+      ? { text: applyRules(raw, rulesCfg), outcome: 'rules-only' }
+      : coordinator.run(raw, detectedLanguage, segmentSignal),
     insert: async (text) => inserter.insertSegment(text),
     deleteWav: async (p) => {
       seg.pending = Math.max(0, seg.pending - 1);
@@ -714,7 +842,18 @@ async function startSegmentedCapture(
       inserter.flushFallback('fatal');
       teardownSegmented('error');
     },
-    onBacklogPressure: () => {}, // t2b3 connects this to the translation circuit.
+    onResult: (result, segment, processingMs) => {
+      if (prepared.snapshot.target !== 'zh') return;
+      prepared.metrics.observe(result.outcome, processingMs);
+      notifyTranslationResult(result, segment.index);
+    },
+    onBacklogPressure: (queuedMs) => {
+      if (coordinator === undefined) return;
+      coordinator.openForBacklog(queuedMs);
+      const notice = prepared.feedback.notificationFor({ text: '', outcome: 'circuit-open' });
+      if (notice !== undefined) void vscode.window.showWarningMessage(notice);
+      log(`[translation] circuit opened by backlog pressure (${queuedMs}ms queued)`);
+    },
     onBacklogLimit: () => {
       void vscode.window.showWarningMessage(
         'VoiceFlow: transcription is falling behind — recording stopped early. Queued segments will still be inserted.',
@@ -801,9 +940,17 @@ async function startSegmentedCapture(
   }
 }
 
+function logSegmentedTranslationMetrics(seg: SegmentedSession): void {
+  if (seg.metricsLogged || seg.prepared.snapshot.target !== 'zh') return;
+  seg.metricsLogged = true;
+  log(formatSessionUsage(seg.prepared.usage.snapshot()));
+  log(`[metrics] translate-session: ${JSON.stringify(seg.prepared.metrics.summary())}`);
+}
+
 function disposeSegmentedResources(seg: SegmentedSession): void {
   if (seg.disposed) return;
   seg.disposed = true;
+  logSegmentedTranslationMetrics(seg);
   if (segmented === seg) segmented = undefined;
   seg.pipeline.cancel();
   seg.controllerOwner.dispose();
@@ -833,6 +980,7 @@ async function stopSegmentedSession(reason: string): Promise<void> {
     statusBar.setSegmentActivity(0);
     session.dispatch('drained');
     log(`[metrics] segmented session done: inserted=${s.inserter.stats.inserted}`);
+    logSegmentedTranslationMetrics(s);
   } catch (err) {
     log(`[dictation] segmented stop failed: ${String(err)}`);
     s.inserter.flushFallback('stop-error');
@@ -864,6 +1012,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     }
 
     // Step 2:whisper 转写(埋点:cold start 与 warm 分开,§8.1)
+    const translationStartedAt = Date.now();
     const activeTranslation = preparedSession;
     const snapshot = activeTranslation?.snapshot ?? captureTranslationSnapshot(vscode.workspace.getConfiguration('voiceflow'));
     const runner = activeTranslation?.runner ?? await getWhisper();
@@ -871,7 +1020,9 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     const stt = await runner.transcribe(result.wavUri.fsPath, {
       ...transcribeOptionsForSession(snapshot),
       signal: sttAbort.signal,
-      language: snapshot.target === 'off' ? undefined : snapshot.sourceHint,
+      language: snapshot.target === 'off'
+        ? undefined
+        : snapshot.target === 'zh' ? 'auto' : snapshot.sourceHint,
     });
     sttAbort = undefined;
     if ((session.state as string) !== 'transcribing') return; // Esc 已取消
@@ -884,24 +1035,53 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     const vfCfg = vscode.workspace.getConfiguration('voiceflow');
     cleaningAbort = new AbortController();
     const tClean = Date.now();
-    const cleanResult = await runCleanup(
-      stt.text,
-      {
-        rules: snapshot.target === 'off' ? getRulesConfig() : snapshot.rules as RulesConfig,
-        timeoutMs: snapshot.target === 'off' ? vfCfg.get<number>('cleanup.timeout', 8000) : snapshot.timeoutMs,
-        enhancer: snapshot.target === 'off'
-          ? await pickEnhancer(vfCfg.get<string>('cleanup.provider', 'auto'))
-          : snapshot.provider,
-        log,
-      },
-      cleaningAbort.signal,
-    );
+    let cleaned: string;
+    if (snapshot.target === 'zh') {
+      if (!activeTranslation || snapshot.provider === undefined) {
+        throw new TranslationUnsupportedError('The frozen LLM translation provider is unavailable.');
+      }
+      const translated = await runTranslate(
+        stt.text,
+        normalizeDetectedLanguage(stt.detectedLanguage),
+        {
+          rules: snapshot.rules as RulesConfig,
+          timeoutMs: snapshot.timeoutMs,
+          provider: snapshot.provider,
+          log,
+          onRequestStart: () => activeTranslation.usage.translationStarted(),
+          onUsage: (usage) => activeTranslation.usage.translationUsage(usage),
+        },
+        cleaningAbort.signal,
+      );
+      cleaned = translated.text;
+      activeTranslation.metrics.observe(translated.outcome, Date.now() - translationStartedAt);
+      const notice = activeTranslation.feedback.notificationFor(translated);
+      if (notice !== undefined) void vscode.window.showWarningMessage(notice);
+      log(`[translation] batch ${translated.outcome}` +
+        (['timeout', 'error', 'empty', 'rejected'].includes(translated.outcome)
+          ? ' — inserted original'
+          : ''));
+      log(`[metrics] translate=${Date.now() - tClean}ms`);
+    } else {
+      const cleanResult = await runCleanup(
+        stt.text,
+        {
+          rules: snapshot.target === 'off' ? getRulesConfig() : snapshot.rules as RulesConfig,
+          timeoutMs: snapshot.target === 'off' ? vfCfg.get<number>('cleanup.timeout', 8000) : snapshot.timeoutMs,
+          enhancer: snapshot.target === 'off'
+            ? await pickEnhancer(vfCfg.get<string>('cleanup.provider', 'auto'))
+            : undefined,
+          log,
+        },
+        cleaningAbort.signal,
+      );
+      cleaned = cleanResult.text;
+      log(
+        `[metrics] cleanup=${Date.now() - tClean}ms provider=${cleanResult.usedProvider}` +
+          (cleanResult.degraded !== undefined ? ` degraded=${cleanResult.degraded}` : ''),
+      );
+    }
     cleaningAbort = undefined;
-    const cleaned = cleanResult.text;
-    log(
-      `[metrics] cleanup=${Date.now() - tClean}ms provider=${cleanResult.usedProvider}` +
-        (cleanResult.degraded !== undefined ? ` degraded=${cleanResult.degraded}` : ''),
-    );
     if ((session.state as string) !== 'cleaning') return; // Esc 已取消
     session.dispatch('cleaned');
 
@@ -957,6 +1137,10 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     log(`[dictation] failed: ${String(err)}`);
     void vscode.window.showErrorMessage(`VoiceFlow: ${String(err)}`);
   } finally {
+    if (preparedSession?.snapshot.target === 'zh') {
+      log(formatSessionUsage(preparedSession.usage.snapshot()));
+      log(`[metrics] translate-session: ${JSON.stringify(preparedSession.metrics.summary())}`);
+    }
     recording?.dispose();
     recording = undefined;
     preparedSession = undefined;

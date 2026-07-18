@@ -52,6 +52,8 @@ export interface PipelineDeps {
   log(line: string): void;
   /** 段处理不可恢复失败(转写重试后仍败/插入抛错)→ 调用方停录 + 状态栏错误 + flush 兜底。 */
   onFatal(err: Error): void;
+  /** Best-effort local metrics/feedback hook after structured cleanup, before insertion. */
+  onResult?(result: TranslationResult, segment: PipelineSegment, processingMs: number): void;
   /** Queued audio crossed half the limit; once per session, independent of the full-limit callback. */
   onBacklogPressure(queuedMs: number): void;
   /** backlog 超限 → 调用方立即停止采集(封口尾段;已入队的本管线继续 drain,v12-②)。 */
@@ -141,6 +143,7 @@ export class SegmentPipeline {
     try {
       while (this.queue.length > 0 && !this.closed) {
         const seg = this.queue.shift()!;
+        const processingStartedAt = Date.now();
         this.queuedAudioMs -= seg.endMs - seg.startMs;
 
         let transcript: SegmentTranscript;
@@ -169,6 +172,11 @@ export class SegmentPipeline {
           return;
         }
         if (this.closed) return;
+        try {
+          this.deps.onResult?.(cleaned, seg, Date.now() - processingStartedAt);
+        } catch {
+          // Local metrics and notifications must never make a segment fatal.
+        }
         if (cleaned.text.length === 0) continue; // 空转写(段内无有效内容)跳过插入——非丢段,转写结果本为空
 
         try {

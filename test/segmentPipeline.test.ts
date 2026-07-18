@@ -249,6 +249,20 @@ describe('SegmentPipeline', () => {
     expect(detected).toBeUndefined();
   });
 
+  it('reports each structured result with its segment and end-to-end processing latency', async () => {
+    const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
+    const observed = vi.fn();
+    t.deps.cleanup = async () => ({ text: '你好', outcome: 'translated', llmMs: 5 });
+    t.deps.onResult = observed;
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(3));
+    await p.drained();
+    expect(observed).toHaveBeenCalledOnce();
+    expect(observed.mock.calls[0]?.[0]).toMatchObject({ text: '你好', outcome: 'translated' });
+    expect(observed.mock.calls[0]?.[1]).toEqual(seg(3));
+    expect(observed.mock.calls[0]?.[2]).toBeGreaterThanOrEqual(0);
+  });
+
   it('CleanupCancelled stops the segment without insertion or fatal callback', async () => {
     const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
     t.deps.cleanup = async () => { throw new CleanupCancelled(); };

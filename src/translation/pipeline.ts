@@ -45,6 +45,8 @@ export interface TranslateOptions {
   timeoutMs: number;
   provider: LlmProvider;
   log?: (line: string) => void;
+  onRequestStart?: () => void;
+  onUsage?: (usage: TokenUsage) => void;
 }
 
 function safeLog(log: TranslateOptions['log'], line: string): void {
@@ -52,6 +54,14 @@ function safeLog(log: TranslateOptions['log'], line: string): void {
     log?.(line);
   } catch {
     // Logging must not turn a translation fallback into a segment failure.
+  }
+}
+
+function safeCallback(callback: (() => void) | undefined): void {
+  try {
+    callback?.();
+  } catch {
+    // Accounting is best-effort and must never change translation behavior.
   }
 }
 
@@ -105,12 +115,19 @@ export async function runTranslate(
         controller.abort();
       }, opts.timeoutMs);
     });
+    safeCallback(opts.onRequestStart);
     const provider = Promise.resolve()
       .then(() => opts.provider.run(TRANSLATE_TO_ZH_PROMPT, source, controller.signal))
       .then(
         (result) => ({ kind: 'provider' as const, result }),
         (error: unknown) => ({ kind: 'provider-error' as const, error }),
       );
+    let usageReported = false;
+    void provider.then((settled) => {
+      if (settled.kind !== 'provider' || usageReported) return;
+      usageReported = true;
+      safeCallback(() => opts.onUsage?.(settled.result.usage));
+    });
     const startedAt = Date.now();
 
     try {

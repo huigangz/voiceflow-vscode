@@ -27,6 +27,61 @@ const options = (llm: LlmProvider, timeoutMs = 300) => ({
 });
 
 describe('runTranslate', () => {
+  it('reports each real provider request and its usage exactly once', async () => {
+    const onRequestStart = vi.fn();
+    const onUsage = vi.fn();
+    const result = await runTranslate('hello', 'en', {
+      ...options(success('你好')),
+      onRequestStart,
+      onUsage,
+    });
+    expect(result.outcome).toBe('translated');
+    expect(onRequestStart).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledWith(usage);
+  });
+
+  it('reports late usage after a hard timeout without delaying the timeout result', async () => {
+    vi.useFakeTimers();
+    try {
+      let settle!: (result: ProviderResult) => void;
+      let usageSettled!: () => void;
+      const usageSettlement = new Promise<void>((resolve) => { usageSettled = resolve; });
+      const onRequestStart = vi.fn();
+      const onUsage = vi.fn(() => usageSettled());
+      const pending = runTranslate('hello', 'en', {
+        ...options(provider(async () => new Promise<ProviderResult>((resolve) => { settle = resolve; })), 50),
+        onRequestStart,
+        onUsage,
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(pending).resolves.toMatchObject({ outcome: 'timeout' });
+      expect(onRequestStart).toHaveBeenCalledOnce();
+      expect(onUsage).not.toHaveBeenCalled();
+
+      settle({ ok: false, kind: 'aborted', usage });
+      await usageSettlement;
+      expect(onUsage).toHaveBeenCalledOnce();
+      expect(onUsage).toHaveBeenCalledWith(usage);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not count identity or empty-source paths as provider requests', async () => {
+    for (const [source, detected] of [['你好', 'zh'], ['  ', 'en']] as const) {
+      const onRequestStart = vi.fn();
+      const onUsage = vi.fn();
+      await runTranslate(source, detected, {
+        ...options(provider(vi.fn())),
+        onRequestStart,
+        onUsage,
+      });
+      expect(onRequestStart).not.toHaveBeenCalled();
+      expect(onUsage).not.toHaveBeenCalled();
+    }
+  });
+
   it('sends the unmodified source with a translation-only untrusted-data instruction, then applies rules to the translation', async () => {
     let seen: [string, string] | undefined;
     const result = await runTranslate(

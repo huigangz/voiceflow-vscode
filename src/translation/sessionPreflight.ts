@@ -1,4 +1,6 @@
 import type { LlmProvider } from '../cleanup/llmProvider';
+import type { TokenUsage } from '../cleanup/llmProvider';
+import { CleanupCancelled } from '../cleanup/pipeline';
 import type { RulesConfig } from '../cleanup/rulesLayer';
 import type { Session } from '../session';
 import type { EngineCapabilities } from '../stt/engineManager';
@@ -30,7 +32,8 @@ export function languageHintForSession(
   snapshot: TranslationSessionSnapshot,
   lockedLanguage: 'zh' | 'en' | undefined,
 ): WhisperLanguage | undefined {
-  return snapshot.target === 'off' ? lockedLanguage : snapshot.sourceHint;
+  if (snapshot.target === 'off') return lockedLanguage;
+  return snapshot.target === 'zh' ? 'auto' : snapshot.sourceHint;
 }
 
 export class TranslationUnsupportedError extends Error {
@@ -40,15 +43,63 @@ export class TranslationUnsupportedError extends Error {
   }
 }
 
+export async function prepareTranslationSnapshot(
+  snapshot: TranslationSessionSnapshot,
+  resolveCapabilities: () => Promise<EngineCapabilities>,
+  selectProvider: () => Promise<LlmProvider | undefined>,
+  signal: AbortSignal,
+  onAuthorizationUsage?: (usage: TokenUsage) => void,
+): Promise<TranslationSessionSnapshot> {
+  if (snapshot.target === 'off') return snapshot;
+  if (snapshot.target === 'en') {
+    await validateTranslationSnapshot(snapshot, { resolveCapabilities }, signal);
+    return snapshot;
+  }
+  if (!snapshot.useLlm) {
+    throw new TranslationUnsupportedError(
+      'Translation to Chinese requires voiceflow.translate.useLlm. Enabling it sends transcript text to an external model.',
+    );
+  }
+  if (signal.aborted) throw new CleanupCancelled();
+  const provider = await selectProvider();
+  if (signal.aborted) throw new CleanupCancelled();
+  if (provider === undefined) {
+    throw new TranslationUnsupportedError(
+      'The selected LLM provider is unavailable. Choose an available provider in voiceflow.cleanup.provider.',
+    );
+  }
+  let prepared;
+  try {
+    prepared = await provider.prepare(signal);
+  } catch (error) {
+    if (signal.aborted) throw new CleanupCancelled();
+    throw new TranslationUnsupportedError(
+      `LLM provider ${provider.name} prepare failed: ${String(error)}`,
+    );
+  }
+  if (signal.aborted) throw new CleanupCancelled();
+  if (prepared.usage !== undefined) {
+    try {
+      onAuthorizationUsage?.(prepared.usage);
+    } catch {
+      // Usage persistence cannot change admission semantics.
+    }
+  }
+  if (!prepared.ok) {
+    throw new TranslationUnsupportedError(
+      `LLM provider ${provider.name} prepare failed (${prepared.kind}): ${prepared.message ?? 'unavailable'}`,
+    );
+  }
+  return createTranslationSessionSnapshot({ ...snapshot, provider });
+}
+
 export async function validateTranslationSnapshot(
   snapshot: TranslationSessionSnapshot,
   engine: { resolveCapabilities(): Promise<EngineCapabilities> },
   signal: AbortSignal,
 ): Promise<void> {
   if (snapshot.target === 'off') return;
-  if (snapshot.target === 'zh') {
-    throw new TranslationUnsupportedError('Translation to Chinese is not available in this build.');
-  }
+  if (snapshot.target === 'zh') return;
   if (signal.aborted) return;
   const capabilities = await engine.resolveCapabilities();
   if (signal.aborted) return;
