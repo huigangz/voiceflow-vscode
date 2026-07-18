@@ -110,24 +110,42 @@ async function requestMessages(
   const cancellation = api.createCancellation();
   const onAbort = () => cancellation.cancel();
   signal.addEventListener('abort', onAbort, { once: true });
-  let inputTokens = 0;
-  let countedInput = false;
+  let inputTokens: number | undefined = 0;
   const usage = (): TokenUsage => ({
-    ...(countedInput ? { inputTokens } : {}),
+    ...(inputTokens === undefined ? {} : { inputTokens }),
     estimate: false,
   });
   try {
     if (signal.aborted) return { ok: false, kind: 'aborted', usage: usage() };
     for (const message of messages) {
-      inputTokens += await model.countTokens(message, cancellation.token);
-      countedInput = true;
+      try {
+        const count = await model.countTokens(message, cancellation.token);
+        if (inputTokens !== undefined) inputTokens += count;
+      } catch {
+        inputTokens = undefined;
+      }
     }
+    if (signal.aborted) return { ok: false, kind: 'aborted', usage: usage() };
     const response = await model.sendRequest(messages, {}, cancellation.token);
     let text = '';
     for await (const fragment of response.text) text += fragment;
     if (signal.aborted) return { ok: false, kind: 'aborted', usage: usage() };
-    const outputTokens = await model.countTokens(text, cancellation.token);
-    return { ok: true, text, usage: { inputTokens, outputTokens, estimate: false } };
+    let outputTokens: number | undefined;
+    try {
+      outputTokens = await model.countTokens(text, cancellation.token);
+    } catch {
+      // Token accounting is best-effort and must not discard a valid response.
+    }
+    if (signal.aborted) return { ok: false, kind: 'aborted', usage: usage() };
+    return {
+      ok: true,
+      text,
+      usage: {
+        ...(inputTokens === undefined ? {} : { inputTokens }),
+        ...(outputTokens === undefined ? {} : { outputTokens }),
+        estimate: false,
+      },
+    };
   } catch (error) {
     return { ok: false, ...normalizeLanguageModelFailure(error, signal), usage: usage() };
   } finally {

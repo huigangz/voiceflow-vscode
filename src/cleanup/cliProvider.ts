@@ -7,8 +7,8 @@
  * - 子进程管道按 utf8 读写,正文走 stdin
  */
 import { spawn } from 'node:child_process';
-import { access, readFile } from 'node:fs/promises';
-import { dirname, extname, join } from 'node:path';
+import { access, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   LlmProvider,
   PrepareResult,
@@ -23,6 +23,25 @@ export type CliKind = 'claude-cli' | 'codex-cli';
 export interface CliInvocation {
   executable: string;
   args: readonly string[];
+  cwd?: string;
+}
+
+export interface CliExecutionContext {
+  neutralDirectory: string;
+  claudeMcpConfigPath: string;
+}
+
+export function createCliExecutionContext(globalStoragePath: string): CliExecutionContext {
+  const neutralDirectory = join(globalStoragePath, 'cli-neutral');
+  return {
+    neutralDirectory,
+    claudeMcpConfigPath: join(neutralDirectory, 'empty-mcp.json'),
+  };
+}
+
+async function ensureExecutionContext(context: CliExecutionContext): Promise<void> {
+  await mkdir(context.neutralDirectory, { recursive: true });
+  await writeFile(context.claudeMcpConfigPath, '{"mcpServers":{}}', 'utf8');
 }
 
 export interface CliLaunchSpec {
@@ -40,24 +59,66 @@ export type CliResolver = (
 ) => Promise<CliResolutionResult>;
 
 /** Each instruction occupies one argv element; transcript data is carried separately on stdin. */
-export function buildCliInvocation(kind: CliKind, instruction: string): CliInvocation {
+export function buildCliInvocation(
+  kind: CliKind,
+  instruction: string,
+  context: CliExecutionContext,
+): CliInvocation {
   switch (kind) {
     case 'claude-cli':
-      return { executable: 'claude', args: ['-p', instruction] };
+      return {
+        executable: 'claude',
+        args: [
+          '--print',
+          '--safe-mode',
+          '--tools',
+          '',
+          '--no-session-persistence',
+          '--strict-mcp-config',
+          '--mcp-config',
+          context.claudeMcpConfigPath,
+          '--no-chrome',
+          instruction,
+        ],
+        cwd: context.neutralDirectory,
+      };
     case 'codex-cli':
-      return { executable: 'codex', args: ['exec', instruction] };
+      return {
+        executable: 'codex',
+        args: [
+          'exec',
+          '--ephemeral',
+          '--ignore-user-config',
+          '--ignore-rules',
+          '--sandbox',
+          'read-only',
+          '--skip-git-repo-check',
+          '-C',
+          context.neutralDirectory,
+          instruction,
+        ],
+        cwd: context.neutralDirectory,
+      };
   }
 }
 
-export function buildCliProbeInvocation(kind: CliKind): CliInvocation {
+export function buildCliProbeInvocation(
+  kind: CliKind,
+  context: CliExecutionContext,
+): CliInvocation {
   return {
     executable: kind === 'claude-cli' ? 'claude' : 'codex',
     args: ['--version'],
+    cwd: context.neutralDirectory,
   };
 }
 
-function invocationForLaunch(launch: CliLaunchSpec, args: readonly string[]): CliInvocation {
-  return { executable: launch.executable, args: [...launch.prefixArgs, ...args] };
+function invocationForLaunch(launch: CliLaunchSpec, invocation: CliInvocation): CliInvocation {
+  return {
+    executable: launch.executable,
+    args: [...launch.prefixArgs, ...invocation.args],
+    ...(invocation.cwd === undefined ? {} : { cwd: invocation.cwd }),
+  };
 }
 
 export type CliExecutionResult =
@@ -77,6 +138,68 @@ export type CliCommandRunner = (
   signal: AbortSignal,
 ) => Promise<CliExecutionResult>;
 
+function killDirectChild(proc: ReturnType<typeof spawn>): void {
+  try {
+    proc.kill('SIGKILL');
+  } catch {
+    // The process may already have exited.
+  }
+}
+
+function terminateProcessTree(proc: ReturnType<typeof spawn>): Promise<void> {
+  if (process.platform !== 'win32' || proc.pid === undefined) {
+    killDirectChild(proc);
+    return Promise.resolve();
+  }
+  return new Promise((resolveTermination) => {
+    let settled = false;
+    const finish = (taskkillSucceeded: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (!taskkillSucceeded) killDirectChild(proc);
+      resolveTermination();
+    };
+    try {
+      const killer = spawn('taskkill', ['/pid', String(proc.pid), '/t', '/f'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.once('error', () => finish(false));
+      killer.once('close', (code) => finish(code === 0));
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+const NPM_PS1_NODE_STATEMENT =
+  /^\s*(?:\$input\s*\|\s*)?&\s+"(?:\$basedir[\\/]node\$exe|node\$exe)"\s+"\$basedir[\\/](?<target>[^"'\r\n]+\.[cm]?js)"\s+\$args\s*$/iu;
+
+async function safeNpmShimTarget(ps1Path: string): Promise<string | undefined> {
+  const statements = (await readFile(ps1Path, 'utf8'))
+    .split(/\r?\n/u)
+    .map((line) => line.match(NPM_PS1_NODE_STATEMENT)?.groups?.target)
+    .filter((target): target is string => target !== undefined);
+  const firstStatement = statements[0];
+  if (firstStatement === undefined) return undefined;
+
+  const base = await realpath(dirname(ps1Path));
+  const targets = new Set<string>();
+  for (const statement of statements) {
+    if (isAbsolute(statement)) return undefined;
+    const segments = statement.split(/[\\/]/u);
+    if (segments.includes('..')) return undefined;
+    const target = await realpath(resolve(base, ...segments));
+    const fromBase = relative(base, target);
+    if (fromBase === '..' || fromBase.startsWith(`..${sep}`) || isAbsolute(fromBase)) {
+      return undefined;
+    }
+    targets.add(process.platform === 'win32' ? target.toLowerCase() : target);
+  }
+  if (targets.size !== 1) return undefined;
+  return await realpath(resolve(base, ...firstStatement.split(/[\\/]/u)));
+}
+
 /**
  * Direct executable/argv transport. Node performs Windows argv quoting without a command shell.
  */
@@ -92,35 +215,41 @@ export function runCliCommand(
     const proc = spawn(invocation.executable, [...invocation.args], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      ...(invocation.cwd === undefined ? {} : { cwd: invocation.cwd }),
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
     });
     let stdout = '';
     let stderr = '';
+    let settled = false;
     proc.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
     proc.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
+    const finish = (result: CliExecutionResult) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve(result);
+    };
     // CLI may launch descendants; cancellation must terminate the whole Windows process tree.
     const onAbort = () => {
-      if (proc.pid !== undefined) {
-        spawn('taskkill', ['/pid', String(proc.pid), '/t', '/f'], { windowsHide: true });
-      }
-      resolve({ ok: false, kind: 'aborted', stdout, stderr });
+      void terminateProcessTree(proc).then(() => {
+        finish({ ok: false, kind: 'aborted', stdout, stderr });
+      });
     };
     signal.addEventListener('abort', onAbort, { once: true });
     proc.on('error', (err) => {
-      signal.removeEventListener('abort', onAbort);
-      resolve({
+      if (signal.aborted) return;
+      finish({
         ok: false,
-        kind: signal.aborted ? 'aborted' : 'spawn-error',
+        kind: 'spawn-error',
         stdout,
         stderr,
         message: String(err),
       });
     });
     proc.on('close', (code) => {
-      signal.removeEventListener('abort', onAbort);
-      if (signal.aborted) resolve({ ok: false, kind: 'aborted', stdout, stderr });
-      else if (code === 0) resolve({ ok: true, stdout, stderr });
-      else resolve({ ok: false, kind: 'exit', code, stdout, stderr });
+      if (signal.aborted) return;
+      if (code === 0) finish({ ok: true, stdout, stderr });
+      else finish({ ok: false, kind: 'exit', code, stdout, stderr });
     });
     proc.stdin.end(stdinText, 'utf8');
   });
@@ -171,13 +300,8 @@ export async function resolveCliLaunch(
     if (extname(candidate).toLowerCase() !== '.cmd') continue;
     const ps1Path = `${candidate.slice(0, -4)}.ps1`;
     try {
-      const ps1 = await readFile(ps1Path, 'utf8');
-      const relativeTarget = ps1.match(
-        /["']\$basedir[\\/](?<target>[^"'\r\n]+\.[cm]?js)["']\s+\$args/iu,
-      )?.groups?.target;
-      if (relativeTarget === undefined) continue;
-      const targetPath = join(dirname(ps1Path), ...relativeTarget.split(/[\\/]/u));
-      await access(targetPath);
+      const targetPath = await safeNpmShimTarget(ps1Path);
+      if (targetPath === undefined) continue;
       const siblingNode = join(dirname(ps1Path), 'node.exe');
       let nodeExecutable = 'node.exe';
       try {
@@ -242,6 +366,7 @@ function classifyFailure(
 
 export function createCliProvider(
   kind: CliKind,
+  context: CliExecutionContext,
   runCommand: CliCommandRunner = runCliCommand,
   resolver: CliResolver = (selectedKind, signal) =>
     resolveCliLaunch(selectedKind, signal, runCommand),
@@ -258,10 +383,11 @@ export function createCliProvider(
     async prepare(signal): Promise<PrepareResult> {
       if (signal.aborted) return { ok: false, kind: 'aborted' };
       try {
+        await ensureExecutionContext(context);
         const resolution = await ensureLaunch(signal);
         if (!resolution.ok) return resolution;
         const result = await runCommand(
-          invocationForLaunch(resolution.launch, buildCliProbeInvocation(kind).args),
+          invocationForLaunch(resolution.launch, buildCliProbeInvocation(kind, context)),
           '',
           signal,
         );
@@ -282,10 +408,11 @@ export function createCliProvider(
       const inputUsage = estimatedUsage(instruction, wrappedText);
       if (signal.aborted) return { ok: false, kind: 'aborted', usage: inputUsage };
       try {
+        await ensureExecutionContext(context);
         const resolution = await ensureLaunch(signal);
         if (!resolution.ok) return { ...resolution, usage: inputUsage };
         const result = await runCommand(
-          invocationForLaunch(resolution.launch, buildCliInvocation(kind, instruction).args),
+          invocationForLaunch(resolution.launch, buildCliInvocation(kind, instruction, context)),
           wrappedText,
           signal,
         );

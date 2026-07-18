@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { CLEANUP_PROMPT, CleanupCancelled, runCleanup } from '../src/cleanup/pipeline';
 import { LlmProvider, ProviderResult } from '../src/cleanup/llmProvider';
 import { DEFAULT_RULES } from '../src/cleanup/rulesLayer';
@@ -66,6 +66,30 @@ describe('清理管线 (F3.3/F3.4)', () => {
     expect(r.text).toBe('你好 world');
     expect(r.usedProvider).toBe('rules');
     expect(r.degraded).toBe('timeout');
+  });
+
+  it('hard timeout settles even when the provider ignores AbortSignal forever', async () => {
+    vi.useFakeTimers();
+    try {
+      let outcome: unknown;
+      void runCleanup('你好world', {
+        ...base,
+        timeoutMs: 50,
+        enhancer: provider(async () => new Promise<ProviderResult>(() => {})),
+      }).then((result) => {
+        outcome = result;
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(outcome).toMatchObject({
+        text: '你好 world',
+        usedProvider: 'rules',
+        degraded: 'timeout',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('增强层抛错 → 回落规则层结果', async () => {
@@ -188,5 +212,22 @@ describe('清理管线 (F3.3/F3.4)', () => {
     );
     setTimeout(() => ac.abort(), 30);
     await expect(p).rejects.toBeInstanceOf(CleanupCancelled);
+  });
+
+  it('Esc settles promptly when the provider ignores AbortSignal forever', async () => {
+    const controller = new AbortController();
+    const pending = runCleanup(
+      '你好world',
+      {
+        ...base,
+        timeoutMs: 10_000,
+        enhancer: provider(async () => new Promise<ProviderResult>(() => {})),
+      },
+      controller.signal,
+    );
+
+    controller.abort();
+
+    await expect(pending).rejects.toBeInstanceOf(CleanupCancelled);
   });
 });

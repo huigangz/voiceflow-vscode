@@ -41,7 +41,11 @@ import { isRealEditorDocScheme } from './insert/logic';
 import { CleanupCancelled, runCleanup } from './cleanup/pipeline';
 import { LlmProvider } from './cleanup/llmProvider';
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
-import { CliKind, createCliProvider } from './cleanup/cliProvider';
+import {
+  CliKind,
+  createCliExecutionContext,
+  createCliProvider,
+} from './cleanup/cliProvider';
 import { StatusBar, refreshTranslationTargetOnConfigurationChange } from './ui/statusBar';
 import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
 import {
@@ -967,7 +971,10 @@ async function pickEnhancer(provider: string): Promise<LlmProvider | undefined> 
       return createVscodeLmProvider(log, extContext.languageModelAccessInformation); // 无模型 → undefined = rules-only
     case 'claude-cli':
     case 'codex-cli':
-      return createCliProvider(provider as CliKind);
+      return createCliProvider(
+        provider as CliKind,
+        createCliExecutionContext(extContext.globalStorageUri.fsPath),
+      );
     default: // 'rules-only'
       return undefined;
   }

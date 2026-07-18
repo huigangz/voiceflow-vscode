@@ -74,30 +74,49 @@ export async function runCleanup(
   if (opts.enhancer === undefined || rulesText.length === 0) {
     return { text: rulesText, usedProvider: 'rules' };
   }
+  const enhancer = opts.enhancer;
   if (signal?.aborted) throw new CleanupCancelled();
 
   // ② 增强层(带超时;外部取消与超时分开判定)
   const ac = new AbortController();
-  const onOuterAbort = () => ac.abort();
-  signal?.addEventListener('abort', onOuterAbort, { once: true });
-  let timeoutFired = false;
-  const timer = setTimeout(() => {
-    timeoutFired = true;
+  let resolveOuterAbort: (() => void) | undefined;
+  const outerAbort = new Promise<{ kind: 'outer-abort' }>((resolve) => {
+    resolveOuterAbort = () => resolve({ kind: 'outer-abort' });
+  });
+  const onOuterAbort = () => {
+    resolveOuterAbort?.();
     ac.abort();
-  }, opts.timeoutMs);
+  };
+  signal?.addEventListener('abort', onOuterAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+    timer = setTimeout(() => {
+      resolve({ kind: 'timeout' });
+      ac.abort();
+    }, opts.timeoutMs);
+  });
+  const provider = Promise.resolve()
+    .then(() => enhancer.run(CLEANUP_PROMPT, rulesText, ac.signal))
+    .then(
+      (result) => ({ kind: 'provider' as const, result }),
+      (error: unknown) => ({ kind: 'provider-error' as const, error }),
+    );
   const t0 = Date.now();
   try {
-    const result = await opts.enhancer.run(CLEANUP_PROMPT, rulesText, ac.signal);
-    if (signal?.aborted) throw new CleanupCancelled();
-    if (timeoutFired) {
+    const outcome = await Promise.race([provider, timeout, outerAbort]);
+    if (outcome.kind === 'outer-abort') throw new CleanupCancelled();
+    if (outcome.kind === 'timeout') {
       opts.log?.(
-        `[cleanup] ${opts.enhancer.name} timeout(${Date.now() - t0}ms) → 规则层结果`,
+        `[cleanup] ${enhancer.name} timeout(${Date.now() - t0}ms) → 规则层结果`,
       );
       return { text: rulesText, usedProvider: 'rules', degraded: 'timeout' };
     }
+    if (outcome.kind === 'provider-error') throw outcome.error;
+    const result = outcome.result;
+    if (signal?.aborted) throw new CleanupCancelled();
     if (!result.ok) {
       opts.log?.(
-        `[cleanup] ${opts.enhancer.name} error(${Date.now() - t0}ms):${result.message ?? result.kind} → 规则层结果`,
+        `[cleanup] ${enhancer.name} error(${Date.now() - t0}ms):${result.message ?? result.kind} → 规则层结果`,
       );
       return { text: rulesText, usedProvider: 'rules', degraded: 'error' };
     }
@@ -105,26 +124,25 @@ export async function runCleanup(
     // Defensive: strip the delimiter if the model echoes it back
     out = out.replace(/^<transcript>\s*/u, '').replace(/\s*<\/transcript>$/u, '').trim();
     if (out.length === 0) {
-      opts.log?.(`[cleanup] ${opts.enhancer.name} 返回空,回落规则层结果`);
+      opts.log?.(`[cleanup] ${enhancer.name} 返回空,回落规则层结果`);
       return { text: rulesText, usedProvider: 'rules', degraded: 'empty' };
     }
     if (looksLikeRefusal(out, rulesText)) {
       opts.log?.(
-        `[cleanup] ${opts.enhancer.name} 输出疑似拒绝/失真("${out.slice(0, 40)}…"),回落规则层结果`,
+        `[cleanup] ${enhancer.name} 输出疑似拒绝/失真("${out.slice(0, 40)}…"),回落规则层结果`,
       );
       return { text: rulesText, usedProvider: 'rules', degraded: 'rejected' };
     }
-    return { text: out, usedProvider: opts.enhancer.name, enhanceMs: Date.now() - t0 };
+    return { text: out, usedProvider: enhancer.name, enhanceMs: Date.now() - t0 };
   } catch (err) {
     if (err instanceof CleanupCancelled) throw err;
     if (signal?.aborted) throw new CleanupCancelled(); // 用户 Esc:整个会话取消
-    const degraded = timeoutFired ? 'timeout' : 'error';
     opts.log?.(
-      `[cleanup] ${opts.enhancer.name} ${degraded}(${Date.now() - t0}ms):${String(err).slice(0, 200)} → 规则层结果`,
+      `[cleanup] ${enhancer.name} error(${Date.now() - t0}ms):${String(err).slice(0, 200)} → 规则层结果`,
     );
-    return { text: rulesText, usedProvider: 'rules', degraded };
+    return { text: rulesText, usedProvider: 'rules', degraded: 'error' };
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
     signal?.removeEventListener('abort', onOuterAbort);
   }
 }

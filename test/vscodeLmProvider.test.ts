@@ -82,6 +82,56 @@ describe('vscode.lm LlmProvider', () => {
     });
   });
 
+  it('run still sends the request when input token counting fails', async () => {
+    let sent = 0;
+    let counts = 0;
+    const chat = model({
+      countTokens: async (value) => {
+        counts++;
+        if (counts === 1) throw new Error('input counter unavailable');
+        return (value as TestMessage).text?.length ?? String(value).length;
+      },
+      sendRequest: async () => {
+        sent++;
+        return { text: asyncText('result') };
+      },
+    });
+    const provider = await createVscodeLmProviderWithApi(api(chat, true), () => {});
+
+    const result = await provider!.run('instruction', 'body', new AbortController().signal);
+
+    expect(sent).toBe(1);
+    expect(result).toEqual({
+      ok: true,
+      text: 'result',
+      usage: { outputTokens: 6, estimate: false },
+    });
+  });
+
+  it('run retains valid text when output token counting fails', async () => {
+    let counts = 0;
+    const chat = model({
+      countTokens: async (value) => {
+        counts++;
+        if (counts === 3) throw new Error('output counter unavailable');
+        return (value as TestMessage).text?.length ?? String(value).length;
+      },
+      sendRequest: async () => ({ text: asyncText('valid result') }),
+    });
+    const provider = await createVscodeLmProviderWithApi(api(chat, true), () => {});
+
+    const result = await provider!.run('instruction', 'body', new AbortController().signal);
+
+    expect(result).toEqual({
+      ok: true,
+      text: 'valid result',
+      usage: {
+        inputTokens: 'instruction'.length + wrapTranscript('body').length,
+        estimate: false,
+      },
+    });
+  });
+
   it.each([
     [true, true, 0],
     [false, false, 0],
@@ -126,6 +176,25 @@ describe('vscode.lm LlmProvider', () => {
       ok: true,
       usage: { inputTokens: 19, outputTokens: 2, estimate: false },
     });
+  });
+
+  it('prepare accepts a successful consent ping when token counting fails', async () => {
+    let sent = 0;
+    const chat = model({
+      countTokens: async () => {
+        throw new Error('counter unavailable');
+      },
+      sendRequest: async () => {
+        sent++;
+        return { text: asyncText('OK') };
+      },
+    });
+    const provider = await createVscodeLmProviderWithApi(api(chat, undefined), () => {});
+
+    const result = await provider!.prepare(new AbortController().signal);
+
+    expect(sent).toBe(1);
+    expect(result).toEqual({ ok: true, usage: { estimate: false } });
   });
 
   it('prepare returns aborted when cancellation lands while selecting a model', async () => {
