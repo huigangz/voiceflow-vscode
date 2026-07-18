@@ -9,11 +9,10 @@ import type { TranslationTarget } from '../translation/sessionPreflight';
 
 export function refreshTranslationTargetOnConfigurationChange(
   event: { affectsConfiguration(section: string): boolean },
-  isIdle: () => boolean,
   readTarget: () => TranslationTarget,
   setTarget: (target: TranslationTarget) => void,
 ): void {
-  if (isIdle() && event.affectsConfiguration('voiceflow.translate.target')) setTarget(readTarget());
+  if (event.affectsConfiguration('voiceflow.translate.target')) setTarget(readTarget());
 }
 
 export class StatusBar implements vscode.Disposable {
@@ -25,6 +24,7 @@ export class StatusBar implements vscode.Disposable {
   private pendingSegments = 0;
   private state: SessionState = 'idle';
   private translationTarget: TranslationTarget = 'off';
+  private configuredTranslationTarget: TranslationTarget = 'off';
 
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
@@ -34,7 +34,10 @@ export class StatusBar implements vscode.Disposable {
 
   setSession(state: SessionState): void {
     this.state = state;
-    if (state === 'idle') this.pendingSegments = 0;
+    if (state === 'idle') {
+      this.pendingSegments = 0;
+      this.translationTarget = this.configuredTranslationTarget;
+    }
     this.stopTimer();
     switch (state) {
       case 'idle':
@@ -84,8 +87,14 @@ export class StatusBar implements vscode.Disposable {
   }
 
   setTranslationTarget(target: TranslationTarget): void {
+    if (this.state === 'idle') this.configuredTranslationTarget = target;
     this.translationTarget = target;
     this.setSession(this.state);
+  }
+
+  setConfiguredTranslationTarget(target: TranslationTarget): void {
+    this.configuredTranslationTarget = target;
+    if (this.state === 'idle') this.setSession('idle');
   }
 
   private translationBadge(): string {

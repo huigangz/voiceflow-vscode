@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { Session } from '../src/session';
 import {
+  MutableStartupResource,
   SessionPreflight,
   TranslationUnsupportedError,
   createTranslationSessionSnapshot,
   languageHintForSession,
   runCancellableStartup,
+  startCancellableFallback,
   transcribeOptionsForSession,
   validateTranslationSnapshot,
 } from '../src/translation/sessionPreflight';
@@ -151,5 +153,126 @@ describe('翻译 preflight 编排(t2a)', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(disposed).toBe(1);
     expect(session.state).toBe('idle');
+  });
+
+  it('off segmented commits recording before admission but Esc still prevents late capture', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let release!: () => void;
+    const admission = new Promise<string>((resolve) => { release = () => resolve('admitted'); });
+    let starts = 0;
+    const startup = runCancellableStartup(
+      preflight,
+      async () => admission,
+      async () => { starts++; return { dispose() {} }; },
+      (resource) => resource.dispose(),
+      { commitImmediately: true },
+    );
+
+    expect(session.state).toBe('recording');
+    expect(preflight.cancel()).toBe(true);
+    release();
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(starts).toBe(0);
+    expect(session.state).toBe('idle');
+  });
+
+  it('target=en segmented remains preparing until recorder startup safely completes', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { release = resolve; });
+    const startup = runCancellableStartup(
+      preflight,
+      async () => 'admitted',
+      async () => { await started; return { dispose() {} }; },
+      (resource) => resource.dispose(),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.state).toBe('preparing');
+    release();
+    await expect(startup).resolves.toMatchObject({ started: true });
+    expect(session.state).toBe('recording');
+  });
+});
+
+describe('segmented mutable startup ownership', () => {
+  it('does not create a fallback after early aggregate disposal', async () => {
+    const abort = new AbortController();
+    const disposed = { addon: 0, helper: 0 };
+    const owner = new MutableStartupResource<{ start(): Promise<void>; dispose(): void }>(
+      (resource) => resource.dispose(),
+    );
+    let rejectAddon!: (error: Error) => void;
+    let helperCreates = 0;
+    const addon = {
+      start: () => new Promise<void>((_, reject) => { rejectAddon = reject; }),
+      dispose: () => { disposed.addon++; },
+    };
+    const startup = startCancellableFallback({
+      signal: abort.signal,
+      owner,
+      createPrimary: () => addon,
+      createFallback: () => {
+        helperCreates++;
+        return { start: async () => {}, dispose: () => { disposed.helper++; } };
+      },
+      shouldFallback: () => true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    abort.abort();
+    owner.dispose();
+    rejectAddon(new Error('fallback eligible'));
+
+    await expect(startup).rejects.toThrow();
+    expect(helperCreates).toBe(0);
+    expect(disposed).toEqual({ addon: 1, helper: 0 });
+  });
+
+  it('disposes a helper exactly once when cancellation lands during helper start', async () => {
+    const abort = new AbortController();
+    const disposed = { addon: 0, helper: 0 };
+    const owner = new MutableStartupResource<{ start(): Promise<void>; dispose(): void }>(
+      (resource) => resource.dispose(),
+    );
+    let releaseHelper!: () => void;
+    let helperStarted!: () => void;
+    const helperStarting = new Promise<void>((resolve) => { helperStarted = resolve; });
+    const startup = startCancellableFallback({
+      signal: abort.signal,
+      owner,
+      createPrimary: () => ({
+        start: async () => { throw new Error('fallback eligible'); },
+        dispose: () => { disposed.addon++; },
+      }),
+      createFallback: () => ({
+        start: () => {
+          helperStarted();
+          return new Promise<void>((resolve) => { releaseHelper = resolve; });
+        },
+        dispose: () => { disposed.helper++; },
+      }),
+      shouldFallback: () => true,
+    });
+    await helperStarting;
+
+    abort.abort();
+    owner.dispose();
+    releaseHelper();
+
+    await expect(startup).rejects.toThrow();
+    expect(disposed).toEqual({ addon: 1, helper: 1 });
+  });
+
+  it('immediately disposes a controller assigned after aggregate disposal', () => {
+    let disposed = 0;
+    const owner = new MutableStartupResource<{ dispose(): void }>((resource) => resource.dispose());
+    owner.dispose();
+
+    expect(owner.replace({ dispose: () => { disposed++; } })).toBe(false);
+    expect(disposed).toBe(1);
   });
 });

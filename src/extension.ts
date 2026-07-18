@@ -44,6 +44,7 @@ import { CliKind, createCliProvider } from './cleanup/cliProvider';
 import { StatusBar, refreshTranslationTargetOnConfigurationChange } from './ui/statusBar';
 import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
 import {
+  MutableStartupResource,
   SessionPreflight,
   TranslationSessionSnapshot,
   TranslationTarget,
@@ -51,6 +52,7 @@ import {
   createTranslationSessionSnapshot,
   languageHintForSession,
   runCancellableStartup,
+  startCancellableFallback,
   transcribeOptionsForSession,
   validateTranslationSnapshot,
 } from './translation/sessionPreflight';
@@ -82,6 +84,7 @@ let addonFallbackCode: 'module-unavailable' | 'blocked-by-policy' | undefined;
 /** P2b:segmented 会话(与 batch 的 `recording` 互斥;同一时刻只有一种会话形态)。 */
 interface SegmentedSession {
   controller: SegmentedRecordingController;
+  controllerOwner: MutableStartupResource<SegmentedRecordingController>;
   pipeline: SegmentPipeline;
   inserter: SegmentInserter;
   releaseLease: (() => void) | undefined;
@@ -143,7 +146,7 @@ export function activate(context: vscode.ExtensionContext): void {
   sessionPreflight = new SessionPreflight(session);
 
   statusBar = new StatusBar();
-  statusBar.setTranslationTarget(
+  statusBar.setConfiguredTranslationTarget(
     vscode.workspace.getConfiguration('voiceflow').get<TranslationTarget>('translate.target', 'off'),
   );
 
@@ -169,11 +172,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((event) =>
       refreshTranslationTargetOnConfigurationChange(
         event,
-        () => session.state === 'idle',
         () => vscode.workspace
           .getConfiguration('voiceflow')
           .get<TranslationTarget>('translate.target', 'off'),
-        (target) => statusBar.setTranslationTarget(target),
+        (target) => statusBar.setConfiguredTranslationTarget(target),
       ),
     ),
     vscode.commands.registerCommand('voiceflow.toggleDictation', toggleDictation),
@@ -192,7 +194,7 @@ export function activate(context: vscode.ExtensionContext): void {
         recording?.dispose();
         if (segmented) {
           segmented.pipeline.cancel();
-          segmented.controller?.dispose();
+          segmented.controllerOwner.dispose();
           segmented.releaseLease?.();
           segmented = undefined;
         }
@@ -339,12 +341,40 @@ function notifyAddonFallback(code: 'module-unavailable' | 'blocked-by-policy'): 
 async function startWithRecorderFallback<T extends { start(): Promise<void>; dispose(): void }>(
   cfg: vscode.WorkspaceConfiguration,
   build: (recorder: Recorder) => T,
+  startup?: { signal: AbortSignal; owner: MutableStartupResource<T> },
 ): Promise<T> {
   const setting = cfg.get<'auto' | 'addon' | 'helper'>('recorder', 'auto');
   const kind: 'addon' | 'helper' =
     setting === 'helper' ? 'helper'
     : setting === 'addon' ? 'addon'
     : addonFallbackCode ? 'helper' : 'addon';
+  if (startup) {
+    let activeKind = kind;
+    const ctrl = await startCancellableFallback({
+      signal: startup.signal,
+      owner: startup.owner,
+      createPrimary: () => build(makeRecorder(kind)),
+      createFallback: () => build(makeRecorder('helper')),
+      shouldFallback: (err) =>
+        setting === 'auto' &&
+        kind === 'addon' &&
+        err instanceof RecorderError &&
+        (err.code === 'module-unavailable' || err.code === 'blocked-by-policy'),
+      onFallback: (err) => {
+        const code = (err as RecorderError).code as 'module-unavailable' | 'blocked-by-policy';
+        addonFallbackCode = code;
+        activeKind = 'helper';
+        log(`[recorder] addon start failed (${code}) — falling back to helper for this runtime`);
+        notifyAddonFallback(code);
+      },
+    });
+    log(
+      activeKind === 'helper' && kind === 'addon'
+        ? '[dictation] recording via helper (fallback)…'
+        : `[dictation] recording via ${activeKind}… (press Ctrl+Alt+L to stop, Esc to cancel)`,
+    );
+    return ctrl;
+  }
   let ctrl = build(makeRecorder(kind));
   try {
     await ctrl.start();
@@ -508,7 +538,7 @@ async function startSegmentedSession(
           },
         }, signal);
         if (signal.aborted) throw new Error('segmented admission cancelled');
-        // ② 形态准入也属于同一 preparing 代际;Esc 后晚到结果不得开始采集。
+        // ② 形态准入属于同一可取消代际;off 虽已同步显示 recording,Esc 仍阻止晚到采集。
         const binaryDir = whisperBinaryDir(cfg);
         const engineMode = await resolveEngineMode({
           mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
@@ -533,6 +563,7 @@ async function startSegmentedSession(
         signal,
       ),
       disposeSegmentedResources,
+      { commitImmediately: snapshot.target === 'off' },
     );
     if (!result.started) return;
     statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
@@ -575,8 +606,13 @@ async function startSegmentedCapture(
     return { runner, release };
   })();
 
+  const controllerOwner = new MutableStartupResource<SegmentedRecordingController>((controller) => {
+    controller.cancel();
+    controller.dispose();
+  });
   const seg: SegmentedSession = {
     controller: undefined as unknown as SegmentedRecordingController,
+    controllerOwner,
     pipeline: undefined as unknown as SegmentPipeline,
     inserter,
     releaseLease: undefined,
@@ -666,7 +702,6 @@ async function startSegmentedCapture(
       log,
       { maxSegmentMs: 20_000 },
     );
-    seg.controller = c;
     c.onSegment = (s) => {
       seg.pending++;
       statusBar.setSegmentActivity(seg.pending);
@@ -710,10 +745,17 @@ async function startSegmentedCapture(
         () => SileroVad.create(modelPath),
       );
       const controller = buildSegController(recorder);
+      if (!controllerOwner.replace(controller)) throw new Error('segmented startup cancelled');
       await controller.start();
+      if (signal.aborted) throw new Error('segmented startup cancelled');
+      seg.controller = controller;
       log('[dictation] recording via loopback (system audio)… (Ctrl+Alt+L to stop, Esc to cancel)');
     } else {
-      await startWithRecorderFallback(cfg, buildSegController);
+      seg.controller = await startWithRecorderFallback(
+        cfg,
+        buildSegController,
+        { signal, owner: controllerOwner },
+      );
     }
     return seg;
   } catch (error) {
@@ -727,8 +769,7 @@ function disposeSegmentedResources(seg: SegmentedSession): void {
   seg.disposed = true;
   if (segmented === seg) segmented = undefined;
   seg.pipeline.cancel();
-  seg.controller?.cancel();
-  seg.controller?.dispose();
+  seg.controllerOwner.dispose();
   seg.releaseLease?.();
   disposeFocusedInputTracker();
   statusBar.setSegmentActivity(0);
@@ -748,7 +789,7 @@ async function stopSegmentedSession(reason: string): Promise<void> {
     if (segmented !== s) return; // drain 期间 fatal/Esc 已 teardown
     await s.inserter.finishSession(); // 终端 Send/Copy 确认(v7-⑤)/ focused-input 单次注入(v6-B)/ 累计入剪贴板
     segmented = undefined;
-    s.controller.dispose();
+    s.controllerOwner.dispose();
     s.releaseLease?.();
     disposeFocusedInputTracker(); // v6-B:segmented 正常结束收口(注入判定已在 finishSession 内取过快照)
     statusBar.setSegmentActivity(0);
@@ -917,8 +958,7 @@ function getRulesConfig(): RulesConfig {
 
 function cancelSession(): void {
   if (!session.active) return;
-  if (session.state === 'preparing') {
-    sessionPreflight.cancel();
+  if (sessionPreflight.cancel()) {
     if (segmented) {
       segmented.inserter.flushFallback('esc-startup');
       disposeSegmentedResources(segmented);
@@ -970,12 +1010,12 @@ async function showRecorderError(err: RecorderError): Promise<void> {
 }
 
 export function deactivate(): Promise<void> | undefined {
-  if (session?.state === 'preparing') sessionPreflight.cancel();
+  sessionPreflight?.cancel();
   recording?.dispose();
   recording = undefined;
   if (segmented) {
     segmented.pipeline.cancel();
-    segmented.controller?.dispose();
+    segmented.controllerOwner.dispose();
     segmented.releaseLease?.();
     segmented = undefined;
   }

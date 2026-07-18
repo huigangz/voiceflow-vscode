@@ -54,25 +54,31 @@ describe('翻译状态栏矩阵(t2a,v3-⑤)', () => {
     let reads = 0;
     const read = () => { reads++; return target; };
     refreshTranslationTargetOnConfigurationChange(
-      { affectsConfiguration: () => false }, () => true, read, (value) => bar.setTranslationTarget(value),
+      { affectsConfiguration: () => false }, read, (value) => bar.setConfiguredTranslationTarget(value),
     );
     expect(reads).toBe(0);
     target = 'en';
     refreshTranslationTargetOnConfigurationChange(
       { affectsConfiguration: (key) => key === 'voiceflow.translate.target' },
-      () => true,
       read,
-      (value) => bar.setTranslationTarget(value),
+      (value) => bar.setConfiguredTranslationTarget(value),
     );
     expect(reads).toBe(1);
     expect(item.text).toContain('→英');
 
     target = 'zh';
+    bar.setTranslationTarget('en');
+    bar.setSession('recording');
     refreshTranslationTargetOnConfigurationChange(
-      { affectsConfiguration: () => true }, () => false, read, (value) => bar.setTranslationTarget(value),
+      { affectsConfiguration: () => true }, read, (value) => bar.setConfiguredTranslationTarget(value),
     );
-    expect(reads).toBe(1);
+    expect(reads).toBe(2);
     expect(item.text).toContain('→英');
+    expect(item.text).not.toContain('→中');
+
+    bar.setSession('idle');
+    expect(item.text).toContain('→中');
+    expect(item.text).not.toContain('→英');
     bar.dispose();
   });
 });
