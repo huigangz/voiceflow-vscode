@@ -5,8 +5,10 @@
  * drain 不丢段(评审 v11-③/v12-②)/ Esc 删未提交段(评审 ④)。
  */
 import { describe, expect, it, vi } from 'vitest';
-import { PipelineDeps, PipelineSegment, SegmentPipeline } from '../src/segment/pipeline';
+import { CleanupCancelled } from '../src/cleanup/pipeline';
+import { PipelineDeps, PipelineSegment, SegmentPipeline, SegmentTranscript } from '../src/segment/pipeline';
 import { WhisperError } from '../src/stt/whisperRunner';
+import { TranslationResult } from '../src/translation/pipeline';
 
 function seg(index: number, durMs = 2000): PipelineSegment {
   return { wavPath: `tmp/seg-${index}.wav`, index, startMs: index * durMs, endMs: (index + 1) * durMs, speechMs: durMs / 2 };
@@ -17,22 +19,27 @@ interface Trace {
   deps: PipelineDeps;
   fatal: Error[];
   backlog: number[];
+  pressure: number[];
 }
 
 function makeDeps(
-  transcribeImpl?: (wavPath: string, signal: AbortSignal) => Promise<string>,
+  transcribeImpl?: (wavPath: string, signal: AbortSignal) => Promise<SegmentTranscript>,
 ): Trace {
   const events: string[] = [];
   const fatal: Error[] = [];
   const backlog: number[] = [];
+  const pressure: number[] = [];
   const deps: PipelineDeps = {
     transcribe: async (wav, signal) => {
       events.push(`transcribe:${wav}`);
       if (transcribeImpl) return transcribeImpl(wav, signal);
       await new Promise((r) => setTimeout(r, 1));
-      return `text-${wav}`;
+      return { text: `text-${wav}`, detectedLanguage: 'en' };
     },
-    cleanup: (raw) => raw,
+    cleanup: async (raw, detectedLanguage, signal): Promise<TranslationResult> => {
+      events.push(`cleanup:${detectedLanguage ?? 'unknown'}:${signal.aborted}`);
+      return { text: raw, outcome: 'rules-only' };
+    },
     insert: async (text) => {
       events.push(`insert:${text}`);
     },
@@ -41,9 +48,10 @@ function makeDeps(
     },
     log: () => {},
     onFatal: (e) => fatal.push(e),
+    onBacklogPressure: (ms) => pressure.push(ms),
     onBacklogLimit: (ms) => backlog.push(ms),
   };
-  return { events, deps, fatal, backlog };
+  return { events, deps, fatal, backlog, pressure };
 }
 
 describe('SegmentPipeline', () => {
@@ -56,9 +64,9 @@ describe('SegmentPipeline', () => {
     await p.drained();
     const order = t.events.filter((e) => !e.startsWith('delete'));
     expect(order).toEqual([
-      'transcribe:tmp/seg-0.wav', 'insert:text-tmp/seg-0.wav',
-      'transcribe:tmp/seg-1.wav', 'insert:text-tmp/seg-1.wav',
-      'transcribe:tmp/seg-2.wav', 'insert:text-tmp/seg-2.wav',
+      'transcribe:tmp/seg-0.wav', 'cleanup:en:false', 'insert:text-tmp/seg-0.wav',
+      'transcribe:tmp/seg-1.wav', 'cleanup:en:false', 'insert:text-tmp/seg-1.wav',
+      'transcribe:tmp/seg-2.wav', 'cleanup:en:false', 'insert:text-tmp/seg-2.wav',
     ]);
   });
 
@@ -67,7 +75,7 @@ describe('SegmentPipeline', () => {
     const t = makeDeps(async () => {
       attempt++;
       if (attempt === 1) throw new WhisperError('transient', 'reset');
-      return 'ok';
+      return { text: 'ok', detectedLanguage: 'en' };
     });
     const p = new SegmentPipeline(t.deps);
     p.enqueue(seg(0));
@@ -87,7 +95,7 @@ describe('SegmentPipeline', () => {
     const t = makeDeps(async (wav) => {
       calls++;
       if (wav === 'tmp/seg-0.wav') throw new WhisperError('permanent', 'invalid wav');
-      return 'ok';
+      return { text: 'ok', detectedLanguage: 'en' };
     });
     const p = new SegmentPipeline(t.deps);
     p.enqueue(seg(0));
@@ -143,14 +151,31 @@ describe('SegmentPipeline', () => {
   it('backlog 超限 → onBacklogLimit 恰一次,已入队段照常 drain 全部插入(评审 v12-②)', async () => {
     const t = makeDeps(async () => {
       await new Promise((r) => setTimeout(r, 5)); // 慢转写,让队列先堆起来
-      return 'ok';
+      return { text: 'ok', detectedLanguage: 'en' };
     });
     const p = new SegmentPipeline(t.deps, 5000); // 上限 5s
     for (let i = 0; i < 4; i++) p.enqueue(seg(i, 2000)); // 8s 音频 > 5s
+    expect(t.pressure).toHaveLength(1);
     expect(t.backlog).toHaveLength(1);
     await p.drained();
+    expect(t.pressure).toHaveLength(1);
     expect(t.backlog).toHaveLength(1); // 不重复触发
     expect(t.events.filter((e) => e.startsWith('insert'))).toHaveLength(4); // 不销毁队列不丢段
+  });
+
+  it('backlog pressure fires once above half-limit without changing the full-limit semantics', async () => {
+    const t = makeDeps(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { text: 'ok', detectedLanguage: 'en' };
+    });
+    const p = new SegmentPipeline(t.deps, 10_000);
+    for (let i = 0; i < 4; i++) p.enqueue(seg(i, 2000)); // first in flight + 6s queued
+    expect(t.pressure).toHaveLength(1);
+    expect(t.pressure[0]).toBe(6000);
+    expect(t.backlog).toHaveLength(0);
+    await p.drained();
+    expect(t.pressure).toHaveLength(1);
+    expect(t.backlog).toHaveLength(0);
   });
 
   it('cancel(Esc):在途 signal aborted、未处理段文件全删、已插入的保留(评审 ④)', async () => {
@@ -161,7 +186,7 @@ describe('SegmentPipeline', () => {
         sawAbort = signal.aborted;
         throw new WhisperError('cancelled', 'aborted');
       }
-      return 'ok';
+      return { text: 'ok', detectedLanguage: 'en' };
     });
     const p = new SegmentPipeline(t.deps);
     p.enqueue(seg(0));
@@ -187,13 +212,59 @@ describe('SegmentPipeline', () => {
   });
 
   it('空转写(cleanup 后为空)跳过插入,继续后段,不算错', async () => {
-    const t = makeDeps(async (wav) => (wav === 'tmp/seg-0.wav' ? '   ' : 'real'));
-    t.deps.cleanup = (raw) => raw.trim();
+    const t = makeDeps(async (wav) => ({ text: wav === 'tmp/seg-0.wav' ? '   ' : 'real' }));
+    t.deps.cleanup = async (raw) => ({ text: raw.trim(), outcome: 'rules-only' });
     const p = new SegmentPipeline(t.deps);
     p.enqueue(seg(0));
     p.enqueue(seg(1));
     await p.drained();
     expect(t.events.filter((e) => e.startsWith('insert'))).toEqual(['insert:real']);
     expect(t.fatal).toHaveLength(0);
+  });
+
+  it('passes detected language and the session signal to async cleanup', async () => {
+    const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en', decodeLanguageHint: 'zh' }));
+    let received: [string | undefined, AbortSignal] | undefined;
+    t.deps.cleanup = async (raw, detectedLanguage, signal) => {
+      received = [detectedLanguage, signal];
+      return { text: raw, outcome: 'translated' };
+    };
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(0));
+    await p.drained();
+    expect(received?.[0]).toBe('en');
+    expect(received?.[1]).toBe(p.signal);
+  });
+
+  it('never promotes decodeLanguageHint to detectedLanguage', async () => {
+    const t = makeDeps(async () => ({ text: 'hello', decodeLanguageHint: 'zh' }));
+    let detected: string | undefined = 'sentinel';
+    t.deps.cleanup = async (raw, detectedLanguage) => {
+      detected = detectedLanguage;
+      return { text: raw, outcome: 'translated' };
+    };
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(0));
+    await p.drained();
+    expect(detected).toBeUndefined();
+  });
+
+  it('CleanupCancelled stops the segment without insertion or fatal callback', async () => {
+    const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
+    t.deps.cleanup = async () => { throw new CleanupCancelled(); };
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(0));
+    await p.drained();
+    expect(t.events.filter((event) => event.startsWith('insert'))).toHaveLength(0);
+    expect(t.fatal).toHaveLength(0);
+  });
+
+  it('off wrapper remains insert-identical while returning a structured Promise', async () => {
+    const t = makeDeps(async () => ({ text: '  ordinary dictation  ' }));
+    t.deps.cleanup = async (raw) => ({ text: raw.trim(), outcome: 'rules-only' });
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(0));
+    await p.drained();
+    expect(t.events.filter((event) => event.startsWith('insert'))).toEqual(['insert:ordinary dictation']);
   });
 });

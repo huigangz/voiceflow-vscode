@@ -668,10 +668,11 @@ async function startSegmentedCapture(
   const pipeline = new SegmentPipeline({
     transcribe: async (wav, segmentSignal, s) => {
       const { runner } = await warmup;
+      const decodeLanguageHint = languageHintForSession(prepared.snapshot, lockedLanguage);
       const r = await runner.transcribe(wav, {
         ...transcribeOptionsForSession(prepared.snapshot),
         signal: segmentSignal,
-        language: languageHintForSession(prepared.snapshot, lockedLanguage),
+        language: decodeLanguageHint,
       });
       log(
         `[metrics] segment #${s.index}${firstSegmentDone ? '' : ' (first)'} ` +
@@ -691,9 +692,13 @@ async function startSegmentedCapture(
           log(`[dictation] session language locked: ${mapped} (segment #${s.index}, speech ${(s.speechMs / 1000).toFixed(1)}s)`);
         }
       }
-      return r.text;
+      return {
+        text: r.text,
+        detectedLanguage: normalizeDetectedLanguage(r.detectedLanguage),
+        decodeLanguageHint,
+      };
     },
-    cleanup: (raw) => applyRules(raw, rulesCfg),
+    cleanup: async (raw) => ({ text: applyRules(raw, rulesCfg), outcome: 'rules-only' }),
     insert: async (text) => inserter.insertSegment(text),
     deleteWav: async (p) => {
       seg.pending = Math.max(0, seg.pending - 1);
@@ -709,6 +714,7 @@ async function startSegmentedCapture(
       inserter.flushFallback('fatal');
       teardownSegmented('error');
     },
+    onBacklogPressure: () => {}, // t2b3 connects this to the translation circuit.
     onBacklogLimit: () => {
       void vscode.window.showWarningMessage(
         'VoiceFlow: transcription is falling behind — recording stopped early. Queued segments will still be inserted.',

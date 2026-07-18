@@ -17,6 +17,8 @@
  *   删除全部未提交段文件;已插入的段保留
  */
 import { WhisperError } from '../stt/whisperRunner';
+import { CleanupCancelled } from '../cleanup/pipeline';
+import type { TranslationResult } from '../translation/pipeline';
 
 export interface PipelineSegment {
   /** WAV 路径(所有权自 enqueue 移交本管线,删除归本层,v8-①)。 */
@@ -27,17 +29,31 @@ export interface PipelineSegment {
   speechMs: number;
 }
 
+export interface SegmentTranscript {
+  text: string;
+  /** Whisper's normalized per-segment detection; the only valid identity evidence. */
+  detectedLanguage?: 'zh' | 'en';
+  /** Decode-only hint (locked/sourceHint). Never promoted to detectedLanguage. */
+  decodeLanguageHint?: string;
+}
+
 export interface PipelineDeps {
   /** 转写一段(signal = 会话级;seg 供外层做语言锁定/埋点,2b-5)。 */
-  transcribe(wavPath: string, signal: AbortSignal, seg: PipelineSegment): Promise<string>;
-  /** 规则清理(v1 只走 rules,D2 后再议 LLM)。 */
-  cleanup(raw: string): string;
+  transcribe(wavPath: string, signal: AbortSignal, seg: PipelineSegment): Promise<SegmentTranscript>;
+  /** Async structured cleanup/translation. CleanupCancelled cancels without insertion or fatal. */
+  cleanup(
+    raw: string,
+    detectedLanguage: string | undefined,
+    signal: AbortSignal,
+  ): Promise<TranslationResult>;
   /** 按序插入(2b-4 dispatcher:锚定插入终点/累计兜底都在里面)。 */
   insert(text: string, seg: PipelineSegment): Promise<void>;
   deleteWav(wavPath: string): Promise<void>;
   log(line: string): void;
   /** 段处理不可恢复失败(转写重试后仍败/插入抛错)→ 调用方停录 + 状态栏错误 + flush 兜底。 */
   onFatal(err: Error): void;
+  /** Queued audio crossed half the limit; once per session, independent of the full-limit callback. */
+  onBacklogPressure(queuedMs: number): void;
   /** backlog 超限 → 调用方立即停止采集(封口尾段;已入队的本管线继续 drain,v12-②)。 */
   onBacklogLimit(queuedMs: number): void;
 }
@@ -50,6 +66,7 @@ export class SegmentPipeline {
   private processing = false;
   private closed = false;
   private queuedAudioMs = 0;
+  private backlogPressureFired = false;
   private backlogFired = false;
   private idleWaiters: Array<() => void> = [];
   /** 会话级取消(v9-③):Esc → cancel() → abort 在途 fetch/等待。 */
@@ -72,6 +89,10 @@ export class SegmentPipeline {
     }
     this.queue.push(seg);
     this.queuedAudioMs += seg.endMs - seg.startMs;
+    if (!this.backlogPressureFired && this.queuedAudioMs > this.backlogLimitMs / 2) {
+      this.backlogPressureFired = true;
+      this.deps.onBacklogPressure(this.queuedAudioMs);
+    }
     if (!this.backlogFired && this.queuedAudioMs > this.backlogLimitMs) {
       this.backlogFired = true;
       this.deps.log(
@@ -122,9 +143,9 @@ export class SegmentPipeline {
         const seg = this.queue.shift()!;
         this.queuedAudioMs -= seg.endMs - seg.startMs;
 
-        let text: string;
+        let transcript: SegmentTranscript;
         try {
-          text = await this.transcribeWithRetry(seg);
+          transcript = await this.transcribeWithRetry(seg);
         } catch (err) {
           if (err instanceof WhisperError && err.kind === 'cancelled') return; // 会话已取消,cancel() 负责清理
           this.failFatal(err instanceof Error ? err : new Error(String(err)));
@@ -132,11 +153,26 @@ export class SegmentPipeline {
         }
 
         if (this.closed) return;
-        const cleaned = this.deps.cleanup(text);
-        if (cleaned.length === 0) continue; // 空转写(段内无有效内容)跳过插入——非丢段,转写结果本为空
+        let cleaned: TranslationResult;
+        try {
+          cleaned = await this.deps.cleanup(
+            transcript.text,
+            transcript.detectedLanguage,
+            this.abortController.signal,
+          );
+        } catch (err) {
+          if (err instanceof CleanupCancelled) {
+            this.cancel();
+            return;
+          }
+          this.failFatal(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
+        if (this.closed) return;
+        if (cleaned.text.length === 0) continue; // 空转写(段内无有效内容)跳过插入——非丢段,转写结果本为空
 
         try {
-          await this.deps.insert(cleaned, seg);
+          await this.deps.insert(cleaned.text, seg);
         } catch (err) {
           this.failFatal(err instanceof Error ? err : new Error(String(err)));
           return;
@@ -149,7 +185,7 @@ export class SegmentPipeline {
   }
 
   /** 重试门控(v3-③/v6-⑤/v9-③);WAV 在**全部尝试结束后**的 finally 删(v8-①/v5-①)。 */
-  private async transcribeWithRetry(seg: PipelineSegment): Promise<string> {
+  private async transcribeWithRetry(seg: PipelineSegment): Promise<SegmentTranscript> {
     try {
       this.throwIfCancelled(); // 尝试前取消检查(v9-③)
       try {
