@@ -151,7 +151,7 @@ describe('vscode.lm LlmProvider', () => {
   it.each([
     ['QuotaExceeded', 'rate-limit'],
     ['NoPermissions', 'unavailable'],
-    ['Blocked', 'unavailable'],
+    ['Blocked', 'rate-limit'],
     ['NotFound', 'unavailable'],
     ['Unknown', 'error'],
   ] as const)('normalizes LanguageModelError code %s to %s and retains input usage', async (code, kind) => {
@@ -171,6 +171,55 @@ describe('vscode.lm LlmProvider', () => {
       message: `${code} failure`,
     });
     if (kind === 'rate-limit') expect(result).toMatchObject({ retryAfterMs: 750 });
+  });
+
+  it('normalizes nested provider quota details from an Unknown LanguageModelError', async () => {
+    const providerError = Object.assign(new Error('provider returned HTTP 429 quota exhausted'), {
+      retryAfterMs: 1500,
+    });
+    const chat = model({
+      sendRequest: async () => {
+        throw Object.assign(new Error('Unknown language model failure'), {
+          code: 'Unknown',
+          cause: providerError,
+        });
+      },
+    });
+    const provider = await createVscodeLmProviderWithApi(api(chat, true), () => {});
+
+    const result = await provider!.run('instruction', 'body', new AbortController().signal);
+
+    expect(result).toMatchObject({ ok: false, kind: 'rate-limit', retryAfterMs: 1500 });
+  });
+
+  it('keeps an ordinary unknown dependency error as error', async () => {
+    const chat = model({
+      sendRequest: async () => {
+        throw new Error('socket closed');
+      },
+    });
+    const provider = await createVscodeLmProviderWithApi(api(chat, true), () => {});
+
+    const result = await provider!.run('instruction', 'body', new AbortController().signal);
+
+    expect(result).toMatchObject({ ok: false, kind: 'error', message: 'socket closed' });
+  });
+
+  it('bounds cyclic structured causes', async () => {
+    const cyclic = Object.assign(new Error('Unknown failure'), { code: 'Unknown' }) as Error & {
+      cause?: unknown;
+    };
+    cyclic.cause = cyclic;
+    const chat = model({
+      sendRequest: async () => {
+        throw cyclic;
+      },
+    });
+    const provider = await createVscodeLmProviderWithApi(api(chat, true), () => {});
+
+    const result = await provider!.run('instruction', 'body', new AbortController().signal);
+
+    expect(result).toMatchObject({ ok: false, kind: 'error' });
   });
 
   it('normalizes an in-flight signal abort to aborted without throwing', async () => {

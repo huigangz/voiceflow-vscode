@@ -3,8 +3,8 @@
  * 仅当用户在设置显式选择 claude-cli / codex-cli 才启用(D9)。
  *
  * Windows 要点(spec F3.5):
- * - npm 全局安装的 CLI 是 .cmd shim → 经 `cmd.exe /d /s /c` 调用
- * - 强制 UTF-8:`chcp 65001` + 子进程管道按 utf8 读写(文本走 stdin,避免命令行引号/长度问题)
+ * - executable + argv 直接传给 spawn,不经 shell 重解析 prompt 中的换行/引号/%VAR%
+ * - 子进程管道按 utf8 读写,正文走 stdin
  */
 import { spawn } from 'node:child_process';
 import {
@@ -18,19 +18,26 @@ import {
 
 export type CliKind = 'claude-cli' | 'codex-cli';
 
-/** 各 CLI 的非交互调用形态(prompt 作参数,待清理文本走 stdin)。 */
-export function buildCliCommandLine(kind: CliKind, instruction: string): string {
-  const prompt = instruction.replace(/"/g, '""');
+export interface CliInvocation {
+  executable: string;
+  args: readonly string[];
+}
+
+/** Each instruction occupies one argv element; transcript data is carried separately on stdin. */
+export function buildCliInvocation(kind: CliKind, instruction: string): CliInvocation {
   switch (kind) {
     case 'claude-cli':
-      return `claude -p "${prompt}"`;
+      return { executable: 'claude', args: ['-p', instruction] };
     case 'codex-cli':
-      return `codex exec "${prompt}"`;
+      return { executable: 'codex', args: ['exec', instruction] };
   }
 }
 
-export function buildCliProbeCommandLine(kind: CliKind): string {
-  return kind === 'claude-cli' ? 'where claude' : 'where codex';
+export function buildCliProbeInvocation(kind: CliKind): CliInvocation {
+  return {
+    executable: kind === 'claude-cli' ? 'claude' : 'codex',
+    args: ['--version'],
+  };
 }
 
 export type CliExecutionResult =
@@ -45,17 +52,16 @@ export type CliExecutionResult =
     };
 
 export type CliCommandRunner = (
-  commandLine: string,
+  invocation: CliInvocation,
   stdinText: string,
   signal: AbortSignal,
 ) => Promise<CliExecutionResult>;
 
 /**
- * 经 cmd /c 运行命令行,stdin 喂 UTF-8 文本,收 UTF-8 stdout。
- * 导出供单元测试(用 node 回声命令验证 UTF-8 round-trip)。
+ * Direct executable/argv transport. Node performs Windows argv quoting without a command shell.
  */
 export function runCliCommand(
-  commandLine: string,
+  invocation: CliInvocation,
   stdinText: string,
   signal: AbortSignal,
 ): Promise<CliExecutionResult> {
@@ -63,18 +69,16 @@ export function runCliCommand(
     return Promise.resolve({ ok: false, kind: 'aborted', stdout: '', stderr: '' });
   }
   return new Promise((resolve) => {
-    const proc = spawn('cmd.exe', ['/d', '/s', '/c', `chcp 65001 >nul && ${commandLine}`], {
+    const proc = spawn(invocation.executable, [...invocation.args], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
-      windowsVerbatimArguments: true,
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
     });
     let stdout = '';
     let stderr = '';
     proc.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
     proc.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
-    // 取消须杀整棵进程树:proc 是 cmd.exe,真正的 CLI 是其子进程,
-    // 单杀 cmd 会留孤儿且 stdio 不关闭(close 永不触发)
+    // CLI may launch descendants; cancellation must terminate the whole Windows process tree.
     const onAbort = () => {
       if (proc.pid !== undefined) {
         spawn('taskkill', ['/pid', String(proc.pid), '/t', '/f'], { windowsHide: true });
@@ -146,7 +150,7 @@ export function createCliProvider(
     async prepare(signal): Promise<PrepareResult> {
       if (signal.aborted) return { ok: false, kind: 'aborted' };
       try {
-        const result = await runCommand(buildCliProbeCommandLine(kind), '', signal);
+        const result = await runCommand(buildCliProbeInvocation(kind), '', signal);
         if (signal.aborted) return { ok: false, kind: 'aborted' };
         if (result.ok) return { ok: true };
         const failure = classifyFailure(result, signal);
@@ -165,7 +169,7 @@ export function createCliProvider(
       if (signal.aborted) return { ok: false, kind: 'aborted', usage: inputUsage };
       try {
         const result = await runCommand(
-          buildCliCommandLine(kind, instruction),
+          buildCliInvocation(kind, instruction),
           wrappedText,
           signal,
         );

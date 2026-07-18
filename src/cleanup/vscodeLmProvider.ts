@@ -53,21 +53,49 @@ function numericProperty(value: unknown, property: string): number | undefined {
   return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : undefined;
 }
 
+function errorChain(error: unknown): unknown[] {
+  const chain: unknown[] = [];
+  const seen = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && depth < 6; depth++) {
+    if (typeof current === 'object' && current !== null) {
+      if (seen.has(current)) break;
+      seen.add(current);
+    }
+    chain.push(current);
+    current =
+      typeof current === 'object' && current !== null
+        ? (current as Record<string, unknown>).cause
+        : undefined;
+  }
+  return chain;
+}
+
 function normalizeLanguageModelFailure(error: unknown, signal: AbortSignal): NormalizedFailure {
   const message = errorMessage(error);
-  const code =
-    typeof error === 'object' && error !== null
-      ? String((error as Record<string, unknown>).code ?? '')
-      : '';
-  const combined = `${code} ${message}`;
-  const retry = numericProperty(error, 'retryAfterMs');
+  const chain = errorChain(error);
+  const combined = chain
+    .map((entry) => {
+      if (typeof entry !== 'object' || entry === null) return errorMessage(entry);
+      const record = entry as Record<string, unknown>;
+      return (
+        `${String(record.code ?? '')} ${String(record.status ?? '')} ` +
+        `${String(record.statusCode ?? '')} ${errorMessage(entry)}`
+      );
+    })
+    .join(' ');
+  const retry = chain
+    .map((entry) => numericProperty(entry, 'retryAfterMs'))
+    .find((value) => value !== undefined);
   if (signal.aborted || /cancel(?:led|ed|ation)/i.test(combined)) {
     return { kind: 'aborted', message };
   }
-  if (/(?:\b429\b|quota|rate[ -]?limit|too many requests|usage limit)/i.test(combined)) {
+  if (
+    /(?:Blocked|\b429\b|quota|rate[ -]?limit|too many requests|usage limit)/i.test(combined)
+  ) {
     return { kind: 'rate-limit', message, ...(retry === undefined ? {} : { retryAfterMs: retry }) };
   }
-  if (/(?:NoPermissions|Blocked|NotFound|unavailable|no model|access denied)/i.test(combined)) {
+  if (/(?:NoPermissions|NotFound|unavailable|no model|access denied)/i.test(combined)) {
     return { kind: 'unavailable', message };
   }
   return { kind: 'error', message };
