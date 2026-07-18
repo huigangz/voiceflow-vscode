@@ -47,6 +47,7 @@ export interface TranslateOptions {
   log?: (line: string) => void;
   onRequestStart?: () => void;
   onUsage?: (usage: TokenUsage) => void;
+  onSettled?: () => void;
 }
 
 function safeLog(log: TranslateOptions['log'], line: string): void {
@@ -124,9 +125,11 @@ export async function runTranslate(
       );
     let usageReported = false;
     void provider.then((settled) => {
-      if (settled.kind !== 'provider' || usageReported) return;
-      usageReported = true;
-      safeCallback(() => opts.onUsage?.(settled.result.usage));
+      if (settled.kind === 'provider' && !usageReported) {
+        usageReported = true;
+        safeCallback(() => opts.onUsage?.(settled.result.usage));
+      }
+      safeCallback(opts.onSettled);
     });
     const startedAt = Date.now();
 

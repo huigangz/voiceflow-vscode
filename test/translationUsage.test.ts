@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { CleanupCancelled } from '../src/cleanup/pipeline';
+import { DEFAULT_RULES } from '../src/cleanup/rulesLayer';
+import { runTranslate } from '../src/translation/pipeline';
+import { settleSessionShutdown } from '../src/translation/sessionPreflight';
 import {
   EMPTY_TRANSLATION_USAGE,
+  TranslationSessionUsageAccounting,
   TranslationUsageStore,
   addUsage,
   formatSessionUsage,
@@ -10,6 +15,106 @@ import {
 } from '../src/translation/usage';
 
 describe('translation usage accumulation', () => {
+  it('attributes late usage to its finalized session while another session is active', () => {
+    const store = new TranslationUsageStore({ get: () => undefined, update: async () => {} });
+    const logA = vi.fn();
+    const logB = vi.fn();
+    const sessionA = new TranslationSessionUsageAccounting(store, logA);
+    const sessionB = new TranslationSessionUsageAccounting(store, logB);
+
+    sessionA.translationStarted();
+    sessionA.finalize();
+    sessionB.translationStarted();
+    sessionA.translationUsage({ inputTokens: 7, outputTokens: 3, estimate: false });
+    sessionA.translationSettled();
+
+    expect(logA).toHaveBeenCalledWith(expect.stringContaining('in=7 out=3'));
+    expect(logB).not.toHaveBeenCalled();
+    sessionB.translationSettled();
+  });
+
+  it('settled waits for every started translation request', async () => {
+    const store = new TranslationUsageStore({ get: () => undefined, update: async () => {} });
+    const accounting = new TranslationSessionUsageAccounting(store, () => {});
+    accounting.translationStarted();
+    let completed = false;
+    const waiting = accounting.settled().then(() => { completed = true; });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    accounting.translationSettled();
+    await waiting;
+    expect(completed).toBe(true);
+  });
+
+  it('shutdown aborts a pending provider and persists its late usage after cleanup', async () => {
+    const writes: unknown[] = [];
+    const events: string[] = [];
+    const store = new TranslationUsageStore({
+      get: () => undefined,
+      update: async (_key, value) => { writes.push(value); },
+    });
+    const accounting = new TranslationSessionUsageAccounting(store, () => {});
+    let providerStarted!: () => void;
+    const started = new Promise<void>((resolve) => { providerStarted = resolve; });
+    let providerAborted = false;
+    const outer = new AbortController();
+    const translating = runTranslate('hello', 'en', {
+      rules: DEFAULT_RULES,
+      timeoutMs: 60_000,
+      provider: {
+        name: 'pending-provider',
+        prepare: async () => ({ ok: true }),
+        run: async (_instruction, _source, signal) => {
+          providerStarted();
+          return new Promise((resolve) => signal.addEventListener('abort', () => {
+            providerAborted = true;
+            resolve({
+              ok: false,
+              kind: 'aborted',
+              usage: { inputTokens: 5, outputTokens: 2, estimate: false },
+            });
+          }, { once: true }));
+        },
+      },
+      onRequestStart: () => accounting.translationStarted(),
+      onUsage: (usage) => accounting.translationUsage(usage),
+      onSettled: () => accounting.translationSettled(),
+    }, outer.signal);
+    await started;
+    let releaseRunner!: () => void;
+    const runnerCleanup = new Promise<void>((resolve) => { releaseRunner = resolve; });
+    let completed = false;
+    const shutdown = settleSessionShutdown({
+      cleanup: [
+        () => outer.abort(),
+        () => { throw new Error('sync cleanup failure'); },
+        async () => { throw new Error('async cleanup failure'); },
+        () => accounting.finalize(),
+        () => runnerCleanup,
+      ],
+      wait: [
+        () => translating.catch((error) => {
+          expect(error).toBeInstanceOf(CleanupCancelled);
+        }),
+        () => accounting.settled(),
+      ],
+      flush: async () => {
+        await store.flushed();
+        events.push('flushed');
+      },
+    }).then(() => { completed = true; });
+
+    await Promise.resolve();
+    expect(providerAborted).toBe(true);
+    expect(completed).toBe(false);
+    releaseRunner();
+    await shutdown;
+    expect(events).toEqual(['flushed']);
+    expect(writes.at(-1)).toMatchObject({
+      translationCalls: { calls: 1, inputTokens: 5, outputTokens: 2 },
+    });
+  });
+
   it('counts true translation requests separately from late exact usage', () => {
     const started = recordRequest(EMPTY_TRANSLATION_USAGE, 'translationCalls');
     const settled = addUsage(started, 'translationCalls', {

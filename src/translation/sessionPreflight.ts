@@ -119,6 +119,83 @@ export interface SessionPreflightOptions {
   onCancel?: () => void;
 }
 
+export interface SessionShutdownWork {
+  cleanup: ReadonlyArray<() => unknown>;
+  wait: ReadonlyArray<() => PromiseLike<unknown>>;
+  flush: () => PromiseLike<unknown>;
+}
+
+export class ShutdownStartedError extends Error {
+  constructor() {
+    super('shutdown started');
+    this.name = 'ShutdownStartedError';
+  }
+}
+
+/** Prevents resource creation from crossing a shutdown boundary. */
+export class ShutdownResourceGate<T> {
+  private closing = false;
+  private readonly pending = new Set<Promise<T>>();
+
+  reopen(): void {
+    this.closing = false;
+  }
+
+  run(
+    create: () => Promise<T>,
+    disposeLate: (resource: T) => PromiseLike<void>,
+  ): Promise<T> {
+    if (this.closing) return Promise.reject(new ShutdownStartedError());
+    const operation = Promise.resolve().then(create).then(async (resource) => {
+      if (!this.closing) return resource;
+      try {
+        await Promise.resolve(disposeLate(resource));
+      } catch {
+        // The caller must still stop even when late cleanup fails.
+      }
+      throw new ShutdownStartedError();
+    });
+    this.pending.add(operation);
+    void operation.then(
+      () => this.pending.delete(operation),
+      () => this.pending.delete(operation),
+    );
+    return operation;
+  }
+
+  async close(): Promise<void> {
+    this.closing = true;
+    while (this.pending.size > 0) {
+      await Promise.allSettled([...this.pending]);
+    }
+  }
+}
+
+/** Starts every cleanup, contains failures, waits late work, then flushes persistence last. */
+export async function settleSessionShutdown(work: SessionShutdownWork): Promise<void> {
+  const pending: Promise<unknown>[] = [];
+  for (const cleanup of work.cleanup) {
+    try {
+      pending.push(Promise.resolve(cleanup()));
+    } catch {
+      // Continue initiating the remaining cleanup work.
+    }
+  }
+  for (const wait of work.wait) {
+    try {
+      pending.push(Promise.resolve(wait()));
+    } catch {
+      // A broken waiter must not prevent persistence flush.
+    }
+  }
+  await Promise.allSettled(pending);
+  try {
+    await Promise.resolve(work.flush());
+  } catch {
+    // Reload cleanup is best-effort and must not reject extension deactivation.
+  }
+}
+
 /** Owns a controller that may be replaced by a fallback while startup is still in flight. */
 export class MutableStartupResource<T> {
   private resource: T | undefined;
@@ -245,6 +322,7 @@ export async function runCancellableStartup<A, R, C = undefined>(
 export class SessionPreflight {
   private generation = 0;
   private current: { controller: AbortController; onCancel: (() => void) | undefined } | undefined;
+  private readonly pendingWork = new Set<Promise<unknown>>();
 
   constructor(private readonly session: Session) {}
 
@@ -264,7 +342,13 @@ export class SessionPreflight {
     const cancelled = new Promise<{ kind: 'cancelled' }>((resolve) => {
       controller.signal.addEventListener('abort', () => resolve({ kind: 'cancelled' }), { once: true });
     });
-    const pending = work(controller.signal).then((value) => ({ kind: 'value' as const, value }));
+    const workPromise = work(controller.signal);
+    this.pendingWork.add(workPromise);
+    void workPromise.then(
+      () => this.pendingWork.delete(workPromise),
+      () => this.pendingWork.delete(workPromise),
+    );
+    const pending = workPromise.then((value) => ({ kind: 'value' as const, value }));
     try {
       const result = await Promise.race([pending, cancelled]);
       if (
@@ -286,6 +370,12 @@ export class SessionPreflight {
         this.session.dispatch('error');
       }
       throw error;
+    }
+  }
+
+  async settled(): Promise<void> {
+    while (this.pendingWork.size > 0) {
+      await Promise.allSettled([...this.pendingWork]);
     }
   }
 

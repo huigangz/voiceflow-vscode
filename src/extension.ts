@@ -51,12 +51,14 @@ import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
 import {
   MutableStartupResource,
   SessionPreflight,
+  ShutdownResourceGate,
   TranslationSessionSnapshot,
   TranslationTarget,
   TranslationUnsupportedError,
   createTranslationSessionSnapshot,
   languageHintForSession,
   runCancellableStartup,
+  settleSessionShutdown,
   startCancellableFallback,
   transcribeOptionsForSession,
   prepareTranslationSnapshot,
@@ -67,13 +69,10 @@ import { TranslationSessionFeedback } from './translation/feedback';
 import { TranslationSessionMetrics } from './translation/metrics';
 import { maybeShowTranslationPrivacyNotice } from './translation/privacyNotice';
 import {
-  EMPTY_TRANSLATION_USAGE,
+  TranslationSessionUsageAccounting,
   TranslationUsageStore,
-  TranslationUsageTotals,
-  addUsage,
   formatSessionUsage,
   formatTranslationUsageReport,
-  recordRequest,
 } from './translation/usage';
 
 let output: vscode.OutputChannel;
@@ -89,12 +88,11 @@ let cleaningAbort: AbortController | undefined;
 let statusBar: StatusBar;
 let sessionPreflight: SessionPreflight;
 let translationUsageStore: TranslationUsageStore;
-interface SessionUsageAccounting {
-  snapshot(): TranslationUsageTotals;
-  translationStarted(): void;
-  translationUsage(usage: import('./cleanup/llmProvider').TokenUsage): void;
-  authorizationUsage(usage: import('./cleanup/llmProvider').TokenUsage): void;
-}
+type SessionUsageAccounting = TranslationSessionUsageAccounting;
+const sessionUsageAccountings = new Set<SessionUsageAccounting>();
+const activeBatchProcessing = new Set<Promise<void>>();
+const whisperGate = new ShutdownResourceGate<EngineManager>();
+let deactivating = false;
 interface PreparedSession {
   snapshot: TranslationSessionSnapshot;
   runner: EngineManager | undefined;
@@ -170,26 +168,15 @@ function log(line: string): void {
 }
 
 function createSessionUsageAccounting(): SessionUsageAccounting {
-  let totals = {
-    translationCalls: { ...EMPTY_TRANSLATION_USAGE.translationCalls },
-    authorizationCalls: { ...EMPTY_TRANSLATION_USAGE.authorizationCalls },
-  };
-  return {
-    snapshot: () => totals,
-    translationStarted: () => {
-      totals = recordRequest(totals, 'translationCalls');
-      translationUsageStore.recordRequest('translationCalls');
-    },
-    translationUsage: (usage) => {
-      totals = addUsage(totals, 'translationCalls', usage);
-      translationUsageStore.addUsage('translationCalls', usage);
-      if (!session.active) log(formatSessionUsage(totals));
-    },
-    authorizationUsage: (usage) => {
-      totals = recordRequest(totals, 'authorizationCalls', usage);
-      translationUsageStore.recordRequest('authorizationCalls', usage);
-    },
-  };
+  const accounting = new TranslationSessionUsageAccounting(translationUsageStore, log);
+  sessionUsageAccountings.add(accounting);
+  return accounting;
+}
+
+function finalizeSessionUsage(accounting: SessionUsageAccounting): ReturnType<SessionUsageAccounting['snapshot']> {
+  const totals = accounting.finalize();
+  void accounting.settled().then(() => sessionUsageAccountings.delete(accounting));
+  return totals;
 }
 
 function showTranslationUsage(): void {
@@ -199,6 +186,8 @@ function showTranslationUsage(): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  deactivating = false;
+  whisperGate.reopen();
   extContext = context;
   output = vscode.window.createOutputChannel('VoiceFlow');
   session = new Session();
@@ -286,7 +275,16 @@ function whisperBinaryDir(cfg: vscode.WorkspaceConfiguration): string {
 }
 
 /** 懒构建/更新 EngineManager(inproc-s4;配置变更时热更新;模型换档触发引擎重载)。 */
-async function getWhisper(): Promise<EngineManager> {
+function getWhisper(): Promise<EngineManager> {
+  return whisperGate.run(resolveWhisper, async (runner) => {
+    // If deactivate already cleared this manager, its captured cleanup owns disposal.
+    if (whisper !== runner) return;
+    whisper = undefined;
+    await runner.dispose();
+  });
+}
+
+async function resolveWhisper(): Promise<EngineManager> {
   const cfg = vscode.workspace.getConfiguration('voiceflow');
   const tier = cfg.get<ModelTier>('model', 'small');
   const binaryDir = whisperBinaryDir(cfg);
@@ -316,8 +314,9 @@ async function getWhisper(): Promise<EngineManager> {
     log,
     onColdStart: (loading: boolean) => statusBar.setModelLoading(loading), // F2.1
   };
-  if (!whisper) {
-    whisper = new EngineManager(runnerCfg, {
+  let runner = whisper;
+  if (!runner) {
+    runner = new EngineManager(runnerCfg, {
       runner: new WhisperRunner(runnerCfg),
       createInprocess: (c) => new InprocessEngine(c),
       ensureInprocessModel: (t) => modelManager.ensureInprocessModel(t),
@@ -333,10 +332,11 @@ async function getWhisper(): Promise<EngineManager> {
         vscode.workspace.getConfiguration('voiceflow').get<InprocessTier>('inprocessModel', 'small-q8'),
       log,
     });
+    whisper = runner;
   } else {
-    await whisper.updateConfig(runnerCfg); // v7-②:等旧代际释放,防新旧引擎并存
+    await runner.updateConfig(runnerCfg); // v7-②:等旧代际释放,防新旧引擎并存
   }
-  return whisper;
+  return runner;
 }
 
 async function toggleDictation(args?: { focus?: FocusHint }): Promise<void> {
@@ -386,6 +386,7 @@ function buildController(recorder: Recorder, cfg: vscode.WorkspaceConfiguration)
     statusBar.showError(`Recording failed: ${err.code}`);
     recording?.dispose();
     recording = undefined;
+    if (preparedSession) finalizeSessionUsage(preparedSession.usage);
     preparedSession = undefined;
     void showRecorderError(err);
   };
@@ -558,7 +559,10 @@ async function startBatchSession(
         captureBeforeAdmission: () => captureTarget(focusHint),
       },
     );
-    if (!result.started) return;
+    if (!result.started) {
+      finalizeSessionUsage(usage);
+      return;
+    }
     preparedSession = result.value.prepared;
     recording = result.value.controller;
     statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
@@ -568,6 +572,7 @@ async function startBatchSession(
     statusBar.showError(preflightFailed ? 'Translation preflight failed' : 'Failed to start recording');
     controllerOwner.dispose();
     recording = undefined;
+    finalizeSessionUsage(usage);
     preparedSession = undefined;
     disposeFocusedInputTracker(); // v5-① 挂点①:启动失败不经处理流程 finally
     if (err instanceof RecorderError) {
@@ -689,9 +694,13 @@ async function startSegmentedSession(
       disposeSegmentedResources,
       { commitImmediately: snapshot.target === 'off' },
     );
-    if (!result.started) return;
+    if (!result.started) {
+      finalizeSessionUsage(usage);
+      return;
+    }
     statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
   } catch (err) {
+    finalizeSessionUsage(usage);
     statusBar.showError('Failed to start recording');
     if (err instanceof RecorderError) void showRecorderError(err);
     else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
@@ -723,6 +732,9 @@ async function startSegmentedCapture(
   // Preserve off-mode parallel warmup. If it resolves after cancellation, release its lease immediately.
   const warmup = (async () => {
     const runner = prepared.runner ?? await getWhisper();
+    if (deactivating || signal.aborted) {
+      throw new WhisperError('cancelled', 'segmented warmup cancelled');
+    }
     const release = runner.acquireLease();
     runner.prepare().catch((e: unknown) =>
       log(`[whisper] warmup failed (first segment will retry): ${String((e as Error)?.message ?? e)}`),
@@ -770,6 +782,7 @@ async function startSegmentedCapture(
             log,
             onRequestStart: () => prepared.usage.translationStarted(),
             onUsage: (usage) => prepared.usage.translationUsage(usage),
+            onSettled: () => prepared.usage.translationSettled(),
           },
           segmentSignal,
         ),
@@ -947,9 +960,11 @@ async function startSegmentedCapture(
 }
 
 function logSegmentedTranslationMetrics(seg: SegmentedSession): void {
-  if (seg.metricsLogged || seg.prepared.snapshot.target !== 'zh') return;
+  if (seg.metricsLogged) return;
   seg.metricsLogged = true;
-  log(formatSessionUsage(seg.prepared.usage.snapshot()));
+  const totals = finalizeSessionUsage(seg.prepared.usage);
+  if (seg.prepared.snapshot.target !== 'zh') return;
+  log(formatSessionUsage(totals));
   log(`[metrics] translate-session: ${JSON.stringify(seg.prepared.metrics.summary())}`);
 }
 
@@ -988,6 +1003,7 @@ async function stopSegmentedSession(reason: string): Promise<void> {
     log(`[metrics] segmented session done: inserted=${s.inserter.stats.inserted}`);
     logSegmentedTranslationMetrics(s);
   } catch (err) {
+    if (deactivating) return;
     log(`[dictation] segmented stop failed: ${String(err)}`);
     s.inserter.flushFallback('stop-error');
     teardownSegmented('error');
@@ -1002,13 +1018,27 @@ function teardownSegmented(kind: 'error' | 'cancel'): void {
   session.dispatch(kind);
 }
 
-async function stopRecordingAndProcess(reason: string): Promise<void> {
-  if (!recording || session.state !== 'recording') return;
+function stopRecordingAndProcess(reason: string): Promise<void> {
+  if (!recording || session.state !== 'recording') return Promise.resolve();
+  const processing = processRecordingAndInsert(reason, recording);
+  activeBatchProcessing.add(processing);
+  void processing.then(
+    () => activeBatchProcessing.delete(processing),
+    () => activeBatchProcessing.delete(processing),
+  );
+  return processing;
+}
+
+async function processRecordingAndInsert(
+  reason: string,
+  activeRecording: RecordingController,
+): Promise<void> {
+  const processingSession = preparedSession;
   session.dispatch('stopRecording');
   let wavUri: vscode.Uri | undefined;
   let finishTranslationObservation: (() => void) | undefined;
   try {
-    const result = await recording.finish();
+    const result = await activeRecording.finish();
     wavUri = result.wavUri;
     log(`[dictation] stop(${reason}): ${result.durationMs}ms, mode=${result.mode}`);
     if (!result.hasSpeech) {
@@ -1017,12 +1047,14 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       session.dispatch('cancel');
       return;
     }
+    if (deactivating || (session.state as string) !== 'transcribing') return;
 
     // Step 2:whisper 转写(埋点:cold start 与 warm 分开,§8.1)
     const translationStartedAt = Date.now();
-    const activeTranslation = preparedSession;
+    const activeTranslation = processingSession;
     const snapshot = activeTranslation?.snapshot ?? captureTranslationSnapshot(vscode.workspace.getConfiguration('voiceflow'));
     const runner = activeTranslation?.runner ?? await getWhisper();
+    if (deactivating) return;
     sttAbort = new AbortController();
     const stt = await runner.transcribe(result.wavUri.fsPath, {
       ...transcribeOptionsForSession(snapshot),
@@ -1057,6 +1089,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
           log,
           onRequestStart: () => activeTranslation.usage.translationStarted(),
           onUsage: (usage) => activeTranslation.usage.translationUsage(usage),
+          onSettled: () => activeTranslation.usage.translationSettled(),
         },
         cleaningAbort.signal,
       );
@@ -1141,6 +1174,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     session.dispatch('inserted');
     log(`[metrics] insert=${Date.now() - t0}ms outcome=${outcome}`);
   } catch (err) {
+    if (deactivating) return;
     if (err instanceof CleanupCancelled || (err instanceof WhisperError && err.kind === 'cancelled')) {
       log('[dictation] cancelled by user');
       return; // 会话已由 cancelSession 置回 idle
@@ -1150,9 +1184,12 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     log(`[dictation] failed: ${String(err)}`);
     void vscode.window.showErrorMessage(`VoiceFlow: ${String(err)}`);
   } finally {
-    if (preparedSession?.snapshot.target === 'zh') {
-      log(formatSessionUsage(preparedSession.usage.snapshot()));
-      log(`[metrics] translate-session: ${JSON.stringify(preparedSession.metrics.summary())}`);
+    if (processingSession) {
+      const totals = finalizeSessionUsage(processingSession.usage);
+      if (!deactivating && processingSession.snapshot.target === 'zh') {
+        log(formatSessionUsage(totals));
+        log(`[metrics] translate-session: ${JSON.stringify(processingSession.metrics.summary())}`);
+      }
     }
     recording?.dispose();
     recording = undefined;
@@ -1220,6 +1257,7 @@ function cancelSession(): void {
   recording?.cancel();
   recording?.dispose();
   recording = undefined;
+  if (preparedSession) finalizeSessionUsage(preparedSession.usage);
   preparedSession = undefined;
   disposeFocusedInputTracker(); // v5-① 挂点②:录音期 Esc 不经处理流程 finally
   sttAbort?.abort(); // 中止进行中的转写(CLI kill / HTTP abort;server 进程保留,v10-① 双信号)
@@ -1251,19 +1289,39 @@ async function showRecorderError(err: RecorderError): Promise<void> {
   else if (action === 'View Logs') output.show();
 }
 
-export function deactivate(): Promise<void> | undefined {
-  sessionPreflight?.cancel();
-  recording?.dispose();
+export function deactivate(): Promise<void> {
+  deactivating = true;
+  const whisperShutdown = whisperGate.close();
+  const preflight = sessionPreflight;
+  const activeRecording = recording;
+  const activeSegmented = segmented;
+  const runner = whisper;
+  const batchProcessing = [...activeBatchProcessing];
+  const accountings = [...sessionUsageAccountings];
   recording = undefined;
-  if (segmented) {
-    segmented.pipeline.cancel();
-    segmented.controllerOwner.dispose();
-    segmented.releaseLease?.();
-    segmented = undefined;
-  }
-  // Reload Window gate:kill whisper server,无残留进程。
-  // v6-③:返回 dispose promise(inprocess 引擎需等在途推理 settle;server/cli 即时)
-  const disposed = whisper?.dispose();
+  preparedSession = undefined;
+  segmented = undefined;
   whisper = undefined;
-  return disposed;
+  return settleSessionShutdown({
+    cleanup: [
+      () => { sttAbort?.abort(); sttAbort = undefined; },
+      () => { cleaningAbort?.abort(); cleaningAbort = undefined; },
+      () => { preflight?.cancel(); },
+      () => activeRecording?.cancel(),
+      () => activeRecording?.dispose(),
+      () => { activeSegmented?.pipeline.cancel(); },
+      () => { activeSegmented?.controllerOwner.dispose(); },
+      () => { activeSegmented?.releaseLease?.(); },
+      () => { if (session?.active) session.dispatch('cancel'); },
+      () => { for (const accounting of accountings) finalizeSessionUsage(accounting); },
+      () => runner?.dispose(),
+    ],
+    wait: [
+      () => preflight?.settled() ?? Promise.resolve(),
+      () => Promise.allSettled(batchProcessing),
+      () => whisperShutdown,
+      ...accountings.map((accounting) => () => accounting.settled()),
+    ],
+    flush: () => translationUsageStore?.flushed() ?? Promise.resolve(),
+  });
 }

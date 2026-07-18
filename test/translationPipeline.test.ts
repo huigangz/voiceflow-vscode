@@ -41,6 +41,27 @@ describe('runTranslate', () => {
     expect(onUsage).toHaveBeenCalledWith(usage);
   });
 
+  it('reports provider settlement after usage, including provider rejection', async () => {
+    const order: string[] = [];
+    const onSettled = vi.fn(() => order.push('settled'));
+    const result = await runTranslate('hello', 'en', {
+      ...options(provider(async () => { throw new Error('provider exploded'); })),
+      onUsage: () => order.push('usage'),
+      onSettled,
+    });
+    expect(result.outcome).toBe('error');
+    expect(order).toEqual(['settled']);
+
+    order.length = 0;
+    await runTranslate('hello', 'en', {
+      ...options(success('你好')),
+      onUsage: () => order.push('usage'),
+      onSettled,
+    });
+    expect(order).toEqual(['usage', 'settled']);
+    expect(onSettled).toHaveBeenCalledTimes(2);
+  });
+
   it('reports late usage after a hard timeout without delaying the timeout result', async () => {
     vi.useFakeTimers();
     try {

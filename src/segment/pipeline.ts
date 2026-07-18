@@ -65,8 +65,13 @@ export interface PipelineDeps {
 /** 2b 默认 backlog 上限:排队音频总时长(2c loopback 只调阈值,v11-③)。 */
 export const DEFAULT_BACKLOG_LIMIT_MS = 60_000;
 
+interface QueuedSegment {
+  segment: PipelineSegment;
+  enqueuedAt: number;
+}
+
 export class SegmentPipeline {
-  private readonly queue: PipelineSegment[] = [];
+  private readonly queue: QueuedSegment[] = [];
   private processing = false;
   private closed = false;
   private queuedAudioMs = 0;
@@ -91,7 +96,7 @@ export class SegmentPipeline {
       void this.deps.deleteWav(seg.wavPath).catch(() => {});
       return;
     }
-    this.queue.push(seg);
+    this.queue.push({ segment: seg, enqueuedAt: Date.now() });
     this.queuedAudioMs += seg.endMs - seg.startMs;
     if (!this.backlogPressureFired && this.queuedAudioMs > this.backlogLimitMs / 2) {
       this.backlogPressureFired = true;
@@ -122,8 +127,8 @@ export class SegmentPipeline {
     if (this.closed) return;
     this.closed = true;
     this.abortController.abort();
-    for (const seg of this.queue.splice(0)) {
-      void this.deps.deleteWav(seg.wavPath).catch(() => {});
+    for (const { segment } of this.queue.splice(0)) {
+      void this.deps.deleteWav(segment.wavPath).catch(() => {});
     }
     this.queuedAudioMs = 0;
     this.notifyIfIdle(true);
@@ -144,8 +149,7 @@ export class SegmentPipeline {
     this.processing = true;
     try {
       while (this.queue.length > 0 && !this.closed) {
-        const seg = this.queue.shift()!;
-        const processingStartedAt = Date.now();
+        const { segment: seg, enqueuedAt: processingStartedAt } = this.queue.shift()!;
         this.queuedAudioMs -= seg.endMs - seg.startMs;
 
         let transcript: SegmentTranscript;

@@ -4,6 +4,9 @@ import {
   MutableStartupResource,
   prepareTranslationSnapshot,
   SessionPreflight,
+  ShutdownResourceGate,
+  ShutdownStartedError,
+  settleSessionShutdown,
   TranslationUnsupportedError,
   createTranslationSessionSnapshot,
   languageHintForSession,
@@ -77,6 +80,77 @@ describe('会话转写路由(t2a)', () => {
 });
 
 describe('翻译 preflight 编排(t2a)', () => {
+  it('disposes a batch Whisper manager that resolves after shutdown starts', async () => {
+    const gate = new ShutdownResourceGate<{ dispose(): Promise<void> }>();
+    let release!: (resource: { dispose(): Promise<void> }) => void;
+    const creation = new Promise<{ dispose(): Promise<void> }>((resolve) => { release = resolve; });
+    const dispose = vi.fn(async () => {});
+    const acquiring = gate.run(() => creation, (resource) => resource.dispose());
+    let shutdownComplete = false;
+    const shutdown = gate.close().then(() => { shutdownComplete = true; });
+
+    await Promise.resolve();
+    expect(shutdownComplete).toBe(false);
+    release({ dispose });
+    await expect(acquiring).rejects.toBeInstanceOf(ShutdownStartedError);
+    await shutdown;
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it('prevents segmented warmup from creating a manager after shutdown starts', async () => {
+    const gate = new ShutdownResourceGate<{ dispose(): Promise<void> }>();
+    await gate.close();
+    const create = vi.fn(async () => ({ dispose: async () => {} }));
+    await expect(gate.run(create, (resource) => resource.dispose()))
+      .rejects.toBeInstanceOf(ShutdownStartedError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('exposes late preflight work settlement after cancellation returns', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const startup = preflight.run(async () => { await gate; return 'late'; });
+    expect(preflight.cancel()).toBe(true);
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+    let settled = false;
+    const waiting = preflight.settled().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  it('shutdown contains cleanup failures and flushes only after all late work settles', async () => {
+    const events: string[] = [];
+    let releaseProvider!: () => void;
+    let releaseRunner!: () => void;
+    const provider = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const runner = new Promise<void>((resolve) => { releaseRunner = resolve; });
+    let complete = false;
+    const shutdown = settleSessionShutdown({
+      cleanup: [
+        () => { events.push('abort'); },
+        () => { throw new Error('sync cleanup failure'); },
+        async () => { throw new Error('async cleanup failure'); },
+      ],
+      wait: [() => provider, () => runner],
+      flush: async () => { events.push('flush'); },
+    }).then(() => { complete = true; });
+
+    await Promise.resolve();
+    expect(events).toContain('abort');
+    expect(events).not.toContain('flush');
+    releaseProvider();
+    await Promise.resolve();
+    expect(complete).toBe(false);
+    releaseRunner();
+    await shutdown;
+    expect(events.at(-1)).toBe('flush');
+  });
+
   it('preparing 单飞:重复开始 no-op;完成后才进入 recording', async () => {
     const session = new Session();
     const preflight = new SessionPreflight(session);

@@ -125,6 +125,67 @@ export class TranslationUsageStore {
   }
 }
 
+/** Session-owned accounting; late provider results never consult another session's state. */
+export class TranslationSessionUsageAccounting {
+  private totals = normalizeTranslationUsage(EMPTY_TRANSLATION_USAGE);
+  private pendingTranslations = 0;
+  private finalized = false;
+  private readonly settlementWaiters: Array<() => void> = [];
+
+  constructor(
+    private readonly store: TranslationUsageStore,
+    private readonly log: (line: string) => void,
+  ) {}
+
+  snapshot(): TranslationUsageTotals {
+    return normalizeTranslationUsage(this.totals);
+  }
+
+  translationStarted(): void {
+    this.pendingTranslations++;
+    this.totals = recordRequest(this.totals, 'translationCalls');
+    this.store.recordRequest('translationCalls');
+  }
+
+  translationUsage(usage: TokenUsage): void {
+    this.totals = addUsage(this.totals, 'translationCalls', usage);
+    this.store.addUsage('translationCalls', usage);
+    if (this.finalized) this.safeLog();
+  }
+
+  translationSettled(): void {
+    if (this.pendingTranslations === 0) return;
+    this.pendingTranslations--;
+    if (this.pendingTranslations === 0) {
+      for (const resolve of this.settlementWaiters.splice(0)) resolve();
+    }
+  }
+
+  authorizationUsage(usage: TokenUsage): void {
+    this.totals = recordRequest(this.totals, 'authorizationCalls', usage);
+    this.store.recordRequest('authorizationCalls', usage);
+    if (this.finalized) this.safeLog();
+  }
+
+  finalize(): TranslationUsageTotals {
+    this.finalized = true;
+    return this.snapshot();
+  }
+
+  settled(): Promise<void> {
+    if (this.pendingTranslations === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => this.settlementWaiters.push(resolve));
+  }
+
+  private safeLog(): void {
+    try {
+      this.log(formatSessionUsage(this.totals));
+    } catch {
+      // Metrics logging cannot change provider/session settlement.
+    }
+  }
+}
+
 function tokenTotals(totals: TranslationUsageTotals): { input: number; output: number } {
   return {
     input: totals.translationCalls.inputTokens + totals.authorizationCalls.inputTokens,

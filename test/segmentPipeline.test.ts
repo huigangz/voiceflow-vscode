@@ -55,6 +55,36 @@ function makeDeps(
 }
 
 describe('SegmentPipeline', () => {
+  it('includes FIFO queue wait in visible latency', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      let releaseFirst!: () => void;
+      const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const t = makeDeps(async (wav) => {
+        if (wav === 'tmp/seg-0.wav') await firstBlocked;
+        return { text: wav, detectedLanguage: 'en' };
+      });
+      const visible = new Map<number, number>();
+      t.deps.insert = async (_text, _segment, onVisible) => { onVisible(); };
+      t.deps.onVisibleResult = (_result, segment, processingMs) => {
+        visible.set(segment.index, processingMs);
+      };
+      const p = new SegmentPipeline(t.deps);
+
+      p.enqueue(seg(0));
+      vi.setSystemTime(100);
+      p.enqueue(seg(1));
+      vi.setSystemTime(1000);
+      releaseFirst();
+      await p.drained();
+
+      expect(visible.get(1)).toBe(900);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('严格保序:前段插入完成后才开始后段转写', async () => {
     const t = makeDeps();
     const p = new SegmentPipeline(t.deps);
