@@ -63,6 +63,11 @@ export type SessionPreflightResult<T> =
   | { started: true; value: T }
   | { started: false; reason: 'busy' | 'cancelled' };
 
+export interface SessionPreflightOptions {
+  commitImmediately?: boolean;
+  onCancel?: () => void;
+}
+
 /** Owns a controller that may be replaced by a fallback while startup is still in flight. */
 export class MutableStartupResource<T> {
   private resource: T | undefined;
@@ -160,7 +165,7 @@ export async function runCancellableStartup<A, R>(
   admit: (signal: AbortSignal) => Promise<A>,
   start: (admission: A, signal: AbortSignal) => Promise<R>,
   disposeLate: (resource: R) => void,
-  options: { commitImmediately?: boolean } = {},
+  options: SessionPreflightOptions = {},
 ): Promise<SessionPreflightResult<R>> {
   let resource: R | undefined;
   let disposed = false;
@@ -186,18 +191,18 @@ export async function runCancellableStartup<A, R>(
 /** Owns one session-level startup generation; cancellation may remain armed after an early UI commit. */
 export class SessionPreflight {
   private generation = 0;
-  private current: AbortController | undefined;
+  private current: { controller: AbortController; onCancel: (() => void) | undefined } | undefined;
 
   constructor(private readonly session: Session) {}
 
   async run<T>(
     work: (signal: AbortSignal) => Promise<T>,
-    options: { commitImmediately?: boolean } = {},
+    options: SessionPreflightOptions = {},
   ): Promise<SessionPreflightResult<T>> {
     if (!this.session.dispatch('prepare')) return { started: false, reason: 'busy' };
     const generation = ++this.generation;
     const controller = new AbortController();
-    this.current = controller;
+    this.current = { controller, onCancel: options.onCancel };
     if (options.commitImmediately) this.session.dispatch('start');
     const cancelled = new Promise<{ kind: 'cancelled' }>((resolve) => {
       controller.signal.addEventListener('abort', () => resolve({ kind: 'cancelled' }), { once: true });
@@ -228,10 +233,12 @@ export class SessionPreflight {
   }
 
   cancel(): boolean {
-    if (!this.current) return false;
+    const current = this.current;
+    if (!current) return false;
     this.generation++;
-    this.current.abort();
     this.current = undefined;
+    current.controller.abort();
+    current.onCancel?.();
     return this.session.dispatch('cancel');
   }
 }

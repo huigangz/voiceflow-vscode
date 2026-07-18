@@ -276,3 +276,149 @@ describe('segmented mutable startup ownership', () => {
     expect(disposed).toBe(1);
   });
 });
+
+describe('batch and toggle startup cancellation', () => {
+  it('batch Esc disposes an in-flight primary immediately and blocks late live assignment', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let releasePrimary!: () => void;
+    let primaryStarted!: () => void;
+    const primaryStarting = new Promise<void>((resolve) => { primaryStarted = resolve; });
+    let disposed = 0;
+    let assignedLive = false;
+    const owner = new MutableStartupResource<{ start(): Promise<void>; dispose(): void }>(
+      (resource) => resource.dispose(),
+    );
+    const startup = runCancellableStartup(
+      preflight,
+      async () => 'admitted',
+      async (_admission, signal) => {
+        const controller = await startCancellableFallback({
+          signal,
+          owner,
+          createPrimary: () => ({
+            start: () => {
+              primaryStarted();
+              return new Promise<void>((resolve) => { releasePrimary = resolve; });
+            },
+            dispose: () => { disposed++; },
+          }),
+          createFallback: () => ({ start: async () => {}, dispose: () => {} }),
+          shouldFallback: () => false,
+        });
+        assignedLive = true;
+        return controller;
+      },
+      () => owner.dispose(),
+      { commitImmediately: true, onCancel: () => owner.dispose() },
+    );
+    await primaryStarting;
+
+    expect(preflight.cancel()).toBe(true);
+    expect(session.state).toBe('idle');
+    expect(disposed).toBe(1);
+    expect(assignedLive).toBe(false);
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+
+    releasePrimary();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposed).toBe(1);
+    expect(assignedLive).toBe(false);
+  });
+
+  it('batch Esc during helper start disposes primary and helper exactly once without going live', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let releaseHelper!: () => void;
+    let helperStarted!: () => void;
+    const helperStarting = new Promise<void>((resolve) => { helperStarted = resolve; });
+    const disposed = { addon: 0, helper: 0 };
+    let assignedLive = false;
+    const owner = new MutableStartupResource<{ start(): Promise<void>; dispose(): void }>(
+      (resource) => resource.dispose(),
+    );
+    const startup = runCancellableStartup(
+      preflight,
+      async () => 'admitted',
+      async (_admission, signal) => {
+        const controller = await startCancellableFallback({
+          signal,
+          owner,
+          createPrimary: () => ({
+            start: async () => { throw new Error('fallback eligible'); },
+            dispose: () => { disposed.addon++; },
+          }),
+          createFallback: () => ({
+            start: () => {
+              helperStarted();
+              return new Promise<void>((resolve) => { releaseHelper = resolve; });
+            },
+            dispose: () => { disposed.helper++; },
+          }),
+          shouldFallback: () => true,
+        });
+        assignedLive = true;
+        return controller;
+      },
+      () => owner.dispose(),
+      { commitImmediately: true, onCancel: () => owner.dispose() },
+    );
+    await helperStarting;
+
+    expect(preflight.cancel()).toBe(true);
+    expect(disposed).toEqual({ addon: 1, helper: 1 });
+    expect(assignedLive).toBe(false);
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+
+    releaseHelper();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposed).toEqual({ addon: 1, helper: 1 });
+    expect(assignedLive).toBe(false);
+  });
+
+  it('toggle during off segmented recorder start cancels instead of finishing an unready controller', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let releaseStart!: () => void;
+    let controllerStarted!: () => void;
+    const controllerStarting = new Promise<void>((resolve) => { controllerStarted = resolve; });
+    let disposed = 0;
+    let finishes = 0;
+    const controller = {
+      start: () => {
+        controllerStarted();
+        return new Promise<void>((resolve) => { releaseStart = resolve; });
+      },
+      finish: async () => { finishes++; },
+      dispose: () => { disposed++; },
+    };
+    const owner = new MutableStartupResource<typeof controller>((resource) => resource.dispose());
+    const startup = runCancellableStartup(
+      preflight,
+      async () => 'admitted',
+      async (_admission, signal) => startCancellableFallback({
+        signal,
+        owner,
+        createPrimary: () => controller,
+        createFallback: () => controller,
+        shouldFallback: () => false,
+      }),
+      () => owner.dispose(),
+      { commitImmediately: true, onCancel: () => owner.dispose() },
+    );
+    await controllerStarting;
+    expect(session.state).toBe('recording');
+
+    // A second toggle must take the live-generation cancellation branch, never normal finish().
+    expect(preflight.cancel()).toBe(true);
+    expect(session.state).toBe('idle');
+    expect(finishes).toBe(0);
+    expect(disposed).toBe(1);
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+
+    releaseStart();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(finishes).toBe(0);
+    expect(disposed).toBe(1);
+  });
+});

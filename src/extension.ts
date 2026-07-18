@@ -83,7 +83,7 @@ let addonFallbackCode: 'module-unavailable' | 'blocked-by-policy' | undefined;
 
 /** P2b:segmented 会话(与 batch 的 `recording` 互斥;同一时刻只有一种会话形态)。 */
 interface SegmentedSession {
-  controller: SegmentedRecordingController;
+  controller: SegmentedRecordingController | undefined;
   controllerOwner: MutableStartupResource<SegmentedRecordingController>;
   pipeline: SegmentPipeline;
   inserter: SegmentInserter;
@@ -281,11 +281,13 @@ async function getWhisper(): Promise<EngineManager> {
 async function toggleDictation(args?: { focus?: FocusHint }): Promise<void> {
   if (session.state === 'idle') {
     await startRecording(args?.focus);
+  } else if (cancelStartingSession('toggle')) {
+    return;
   } else if (session.state === 'recording') {
     if (segmented) await stopSegmentedSession('toggle');
     else await stopRecordingAndProcess('toggle');
   }
-  // 其他阶段(含 draining):toggle 无效(取消走 Esc,spec §5.3)
+  // 其他无 startup 的阶段(含 draining):toggle 无效(取消走 Esc,spec §5.3)
 }
 
 /** P2a:按配置与运行期回退状态选录音后端。webview 路线已 No-Go(microsoft/vscode#250568),不在枚举内。 */
@@ -419,60 +421,78 @@ function captureTranslationSnapshot(cfg: vscode.WorkspaceConfiguration): Transla
   });
 }
 
-/** Freeze translation privacy/routing inputs, then move preparing → recording only for this generation. */
-async function prepareSession(cfg: vscode.WorkspaceConfiguration): Promise<PreparedSession | undefined> {
-  const snapshot = captureTranslationSnapshot(cfg);
-  statusBar.setTranslationTarget(snapshot.target);
-  // off 保持同步穿透:不引入一次 await 的焦点快照漂移,也不让 preparing spinner 可见。
-  if (snapshot.target === 'off') {
-    if (!session.dispatch('prepare')) return undefined;
-    session.dispatch('start');
-    return { snapshot, runner: undefined };
-  }
+/** Resolve translation admission without ending the startup generation before recorder readiness. */
+async function admitBatchSession(
+  snapshot: TranslationSessionSnapshot,
+  signal: AbortSignal,
+): Promise<PreparedSession> {
+  if (snapshot.target === 'off') return { snapshot, runner: undefined };
   let resolvedRunner: EngineManager | undefined;
-  try {
-    const result = await sessionPreflight.run(async (signal) => {
-      await validateTranslationSnapshot(snapshot, {
-        resolveCapabilities: async () => {
-          resolvedRunner = await getWhisper();
-          return resolvedRunner.resolveCapabilities();
-        },
-      }, signal);
-      return { snapshot, runner: resolvedRunner };
-    });
-    return result.started ? result.value : undefined;
-  } catch (error) {
-    const message = error instanceof TranslationUnsupportedError ? error.message : String(error);
-    statusBar.showError('Translation preflight failed');
-    log(`[translation] preflight failed: ${message}`);
-    void vscode.window.showErrorMessage(`VoiceFlow: ${message}`);
-    return undefined;
-  }
+  await validateTranslationSnapshot(snapshot, {
+    resolveCapabilities: async () => {
+      resolvedRunner = await getWhisper();
+      return resolvedRunner.resolveCapabilities();
+    },
+  }, signal);
+  return { snapshot, runner: resolvedRunner };
 }
 
 async function startBatchSession(
   cfg: vscode.WorkspaceConfiguration,
   focusHint: FocusHint,
 ): Promise<void> {
-  const prepared = await prepareSession(cfg);
-  if (!prepared) return;
-  preparedSession = prepared;
-  // F4:插入目标在录音开始时锁定
-  insertTarget = captureTarget(focusHint);
-  log(`[dictation] target locked: ${insertTarget.kind}`);
-  if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
+  const snapshot = captureTranslationSnapshot(cfg);
+  statusBar.setTranslationTarget(snapshot.target);
+  const controllerOwner = new MutableStartupResource<RecordingController>((controller) => {
+    controller.cancel();
+    controller.dispose();
+  });
   try {
-    recording = await startWithRecorderFallback(cfg, (r) => buildController(r, cfg));
+    const result = await runCancellableStartup(
+      sessionPreflight,
+      (signal) => admitBatchSession(snapshot, signal),
+      async (prepared, signal) => {
+        // F4:插入目标在录音开始时锁定
+        insertTarget = captureTarget(focusHint);
+        log(`[dictation] target locked: ${insertTarget.kind}`);
+        if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
+        const controller = await startWithRecorderFallback(
+          cfg,
+          (recorder) => buildController(recorder, cfg),
+          { signal, owner: controllerOwner },
+        );
+        return { prepared, controller };
+      },
+      () => controllerOwner.dispose(),
+      {
+        commitImmediately: snapshot.target === 'off',
+        onCancel: () => {
+          controllerOwner.dispose();
+          disposeFocusedInputTracker();
+        },
+      },
+    );
+    if (!result.started) return;
+    preparedSession = result.value.prepared;
+    recording = result.value.controller;
     statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
   } catch (err) {
     session.dispatch('error');
-    statusBar.showError('Failed to start recording');
-    recording?.dispose();
+    const preflightFailed = snapshot.target !== 'off' && controllerOwner.isDisposed === false;
+    statusBar.showError(preflightFailed ? 'Translation preflight failed' : 'Failed to start recording');
+    controllerOwner.dispose();
     recording = undefined;
     preparedSession = undefined;
     disposeFocusedInputTracker(); // v5-① 挂点①:启动失败不经处理流程 finally
-    if (err instanceof RecorderError) void showRecorderError(err);
-    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
+    if (err instanceof RecorderError) {
+      void showRecorderError(err);
+    } else {
+      const message = String(err);
+      if (preflightFailed) log(`[translation] preflight failed: ${message}`);
+      void vscode.window.showErrorMessage(
+        preflightFailed ? `VoiceFlow: ${message}` : `VoiceFlow: failed to start recording — ${message}`,
+      );
+    }
   }
 }
 
@@ -611,7 +631,7 @@ async function startSegmentedCapture(
     controller.dispose();
   });
   const seg: SegmentedSession = {
-    controller: undefined as unknown as SegmentedRecordingController,
+    controller: undefined,
     controllerOwner,
     pipeline: undefined as unknown as SegmentPipeline,
     inserter,
@@ -778,12 +798,13 @@ function disposeSegmentedResources(seg: SegmentedSession): void {
 /** 正常停止(热键/自动停/backlog):封口尾段 → drain FIFO 全部段完成 → 终端确认/兜底 flush → idle。 */
 async function stopSegmentedSession(reason: string): Promise<void> {
   const s = segmented;
-  if (!s || s.stopping || session.state !== 'recording') return;
+  if (!s || !s.controller || s.stopping || session.state !== 'recording') return;
+  const controller = s.controller;
   s.stopping = true;
   log(`[dictation] segmented stop(${reason})`);
   session.dispatch('drainStart');
   try {
-    const { durationMs } = await s.controller.finish(); // 冲刷尾帧 + 封口尾段 + 段 WAV 全落盘
+    const { durationMs } = await controller.finish(); // 冲刷尾帧 + 封口尾段 + 段 WAV 全落盘
     log(`[dictation] recording ended (${durationMs}ms), draining ${s.pending} pending segment(s)…`);
     await s.pipeline.drained();
     if (segmented !== s) return; // drain 期间 fatal/Esc 已 teardown
@@ -956,17 +977,21 @@ function getRulesConfig(): RulesConfig {
   };
 }
 
+function cancelStartingSession(trigger: 'Esc' | 'toggle'): boolean {
+  if (!sessionPreflight.cancel()) return false;
+  if (segmented) {
+    segmented.inserter.flushFallback(trigger === 'Esc' ? 'esc-startup' : 'toggle-startup');
+    disposeSegmentedResources(segmented);
+  }
+  preparedSession = undefined;
+  disposeFocusedInputTracker();
+  log(`[dictation] session startup cancelled (${trigger})`);
+  return true;
+}
+
 function cancelSession(): void {
   if (!session.active) return;
-  if (sessionPreflight.cancel()) {
-    if (segmented) {
-      segmented.inserter.flushFallback('esc-startup');
-      disposeSegmentedResources(segmented);
-    }
-    preparedSession = undefined;
-    log('[dictation] session preflight wait cancelled (Esc)');
-    return;
-  }
+  if (cancelStartingSession('Esc')) return;
   if (segmented) {
     // 分段 Esc 语义(spec §5.3 修订):停录 + abort 在途 + 删未提交段文件,已插入的段不回收;
     // 已完成未插入的累计文本先 flush(v4-② Esc 路径)
