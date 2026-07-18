@@ -827,7 +827,10 @@ async function startSegmentedCapture(
     cleanup: async (raw, detectedLanguage, segmentSignal) => coordinator === undefined
       ? { text: applyRules(raw, rulesCfg), outcome: 'rules-only' }
       : coordinator.run(raw, detectedLanguage, segmentSignal),
-    insert: async (text) => inserter.insertSegment(text),
+    insert: async (text, _segment, onVisible) => inserter.insertSegment(
+      text,
+      prepared.snapshot.target === 'zh' ? onVisible : undefined,
+    ),
     deleteWav: async (p) => {
       seg.pending = Math.max(0, seg.pending - 1);
       statusBar.setSegmentActivity(seg.pending);
@@ -842,10 +845,13 @@ async function startSegmentedCapture(
       inserter.flushFallback('fatal');
       teardownSegmented('error');
     },
-    onResult: (result, segment, processingMs) => {
+    onResult: (result, segment, _processingMs) => {
+      if (prepared.snapshot.target !== 'zh') return;
+      notifyTranslationResult(result, segment.index);
+    },
+    onVisibleResult: (result, _segment, processingMs) => {
       if (prepared.snapshot.target !== 'zh') return;
       prepared.metrics.observe(result.outcome, processingMs);
-      notifyTranslationResult(result, segment.index);
     },
     onBacklogPressure: (queuedMs) => {
       if (coordinator === undefined) return;

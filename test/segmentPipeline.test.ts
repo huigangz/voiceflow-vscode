@@ -249,7 +249,7 @@ describe('SegmentPipeline', () => {
     expect(detected).toBeUndefined();
   });
 
-  it('reports each structured result with its segment and end-to-end processing latency', async () => {
+  it('reports each structured feedback result immediately after cleanup', async () => {
     const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
     const observed = vi.fn();
     t.deps.cleanup = async () => ({ text: '你好', outcome: 'translated', llmMs: 5 });
@@ -263,26 +263,51 @@ describe('SegmentPipeline', () => {
     expect(observed.mock.calls[0]?.[2]).toBeGreaterThanOrEqual(0);
   });
 
-  it('does not report visible completion until insertion has finished', async () => {
+  it('reports feedback after cleanup but visible completion only after insertion finishes', async () => {
     const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
     let finishInsert!: () => void;
     let insertStarted!: () => void;
     const started = new Promise<void>((resolve) => { insertStarted = resolve; });
     t.deps.cleanup = async () => ({ text: '你好', outcome: 'translated' });
-    t.deps.insert = async () => {
+    t.deps.insert = async (_text, _segment, onVisible) => {
       insertStarted();
       await new Promise<void>((resolve) => { finishInsert = resolve; });
+      onVisible();
     };
-    const observed = vi.fn();
-    t.deps.onResult = observed;
+    const feedback = vi.fn();
+    const visible = vi.fn();
+    t.deps.onResult = feedback;
+    (t.deps as typeof t.deps & { onVisibleResult: typeof visible }).onVisibleResult = visible;
     const p = new SegmentPipeline(t.deps);
     p.enqueue(seg(4));
 
     await started;
-    expect(observed).not.toHaveBeenCalled();
+    expect(feedback).toHaveBeenCalledOnce();
+    expect(visible).not.toHaveBeenCalled();
     finishInsert();
     await p.drained();
-    expect(observed).toHaveBeenCalledOnce();
+    expect(feedback).toHaveBeenCalledOnce();
+    expect(visible).toHaveBeenCalledOnce();
+  });
+
+  it('drains accumulated insertion without waiting for its deferred visible completion', async () => {
+    const t = makeDeps(async () => ({ text: 'hello', detectedLanguage: 'en' }));
+    let completeVisible: (() => void) | undefined;
+    t.deps.cleanup = async () => ({ text: '你好', outcome: 'translated' });
+    t.deps.insert = async (_text, _segment, onVisible) => {
+      completeVisible = onVisible;
+    };
+    const visible = vi.fn();
+    (t.deps as typeof t.deps & { onVisibleResult: typeof visible }).onVisibleResult = visible;
+    const p = new SegmentPipeline(t.deps);
+    p.enqueue(seg(5));
+
+    await p.drained();
+    expect(completeVisible).toBeTypeOf('function');
+    expect(visible).not.toHaveBeenCalled();
+    completeVisible?.();
+    completeVisible?.();
+    expect(visible).toHaveBeenCalledOnce();
   });
 
   it('CleanupCancelled stops the segment without insertion or fatal callback', async () => {

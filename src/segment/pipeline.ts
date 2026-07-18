@@ -46,14 +46,16 @@ export interface PipelineDeps {
     detectedLanguage: string | undefined,
     signal: AbortSignal,
   ): Promise<TranslationResult>;
-  /** 按序插入(2b-4 dispatcher:锚定插入终点/累计兜底都在里面)。 */
-  insert(text: string, seg: PipelineSegment): Promise<void>;
+  /** 按序提交插入；累计路径保存 onVisible 并立即返回，最终输出成功后再调用。 */
+  insert(text: string, seg: PipelineSegment, onVisible: () => void): Promise<void>;
   deleteWav(wavPath: string): Promise<void>;
   log(line: string): void;
   /** 段处理不可恢复失败(转写重试后仍败/插入抛错)→ 调用方停录 + 状态栏错误 + flush 兜底。 */
   onFatal(err: Error): void;
-  /** Best-effort local metrics/feedback hook after successful insertion (or an empty no-op). */
+  /** Best-effort feedback hook immediately after structured cleanup. */
   onResult?(result: TranslationResult, segment: PipelineSegment, processingMs: number): void;
+  /** Best-effort metric hook after successful final output (or an empty no-op). */
+  onVisibleResult?(result: TranslationResult, segment: PipelineSegment, processingMs: number): void;
   /** Queued audio crossed half the limit; once per session, independent of the full-limit callback. */
   onBacklogPressure(queuedMs: number): void;
   /** backlog 超限 → 调用方立即停止采集(封口尾段;已入队的本管线继续 drain,v12-②)。 */
@@ -172,25 +174,32 @@ export class SegmentPipeline {
           return;
         }
         if (this.closed) return;
-        const reportResult = (): void => {
+        try {
+          this.deps.onResult?.(cleaned, seg, Date.now() - processingStartedAt);
+        } catch {
+          // Feedback must never make a segment fatal.
+        }
+        let visibleReported = false;
+        const reportVisible = (): void => {
+          if (visibleReported) return;
+          visibleReported = true;
           try {
-            this.deps.onResult?.(cleaned, seg, Date.now() - processingStartedAt);
+            this.deps.onVisibleResult?.(cleaned, seg, Date.now() - processingStartedAt);
           } catch {
-            // Local metrics and notifications must never make a segment fatal.
+            // Local metrics must never make successful output fatal.
           }
         };
         if (cleaned.text.length === 0) {
-          reportResult();
+          reportVisible();
           continue; // 空转写(段内无有效内容)跳过插入——非丢段,转写结果本为空
         }
 
         try {
-          await this.deps.insert(cleaned.text, seg);
+          await this.deps.insert(cleaned.text, seg, reportVisible);
         } catch (err) {
           this.failFatal(err instanceof Error ? err : new Error(String(err)));
           return;
         }
-        reportResult();
       }
     } finally {
       this.processing = false;
