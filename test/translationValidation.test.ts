@@ -22,9 +22,22 @@ describe('translation-aware post-validation', () => {
     '无法翻译您所提供的文本。',
     'I cannot translate the provided content.',
     'I cannot provide a translation.',
+    'I cannot provide the translation.',
+    'I cannot provide translated output.',
+    'I cannot provide translated content.',
+    'I am unable to process the provided request.',
   ])('rejects explicit meta replies: %s', (output) => {
     expect(TRANSLATION_META_REFUSAL_RE.test(output)).toBe(true);
     expect(isTranslationOutputRejected('hello', output)).toBe(true);
+  });
+
+  it.each([
+    'I cannot provide transportation today.',
+    'I cannot provide lunch.',
+    'The UI says "I cannot provide access".',
+  ])('allows unrelated English cannot-provide content: %s', (output) => {
+    expect(TRANSLATION_META_REFUSAL_RE.test(output)).toBe(false);
+    expect(isTranslationOutputRejected('source text', output)).toBe(false);
   });
 
   it.each([
