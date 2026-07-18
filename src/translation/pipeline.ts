@@ -88,13 +88,13 @@ export async function runTranslate(
     applyRulesPreservingNonEmpty(source, rulesTransform, opts.log);
   try {
     if (outerSignal?.aborted) throw new CleanupCancelled();
+    if (rawFallback.length === 0) return { text: '', outcome: 'empty' };
     if (normalizeDetectedLanguage(detectedLanguage) === 'zh') {
       return {
         text: applyRulesPreservingNonEmpty(source, rulesTransform, opts.log),
         outcome: 'identity',
       };
     }
-    if (rawFallback.length === 0) return { text: '', outcome: 'empty' };
 
     const controller = new AbortController();
     let resolveOuterAbort: (() => void) | undefined;

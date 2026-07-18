@@ -27,6 +27,18 @@ const options = (llm: LlmProvider, timeoutMs = 300) => ({
 });
 
 describe('runTranslate', () => {
+  it.each([
+    ['', 'zh'],
+    ['   ', 'zh'],
+    ['', 'chinese'],
+    [' \n\t ', 'chinese'],
+  ] as const)('classifies empty source as empty before Chinese identity (%j, %s)', async (source, detected) => {
+    const run = vi.fn();
+    const result = await runTranslate(source, detected, options(provider(run)));
+    expect(result).toEqual({ text: '', outcome: 'empty' });
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it('reports each real provider request and its usage exactly once', async () => {
     const onRequestStart = vi.fn();
     const onUsage = vi.fn();

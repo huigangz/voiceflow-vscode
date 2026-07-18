@@ -1,11 +1,33 @@
 import { describe, expect, it, vi } from 'vitest';
 import { CleanupCancelled } from '../src/cleanup/pipeline';
-import { TranslationResult } from '../src/translation/pipeline';
+import { runTranslate, TranslationResult } from '../src/translation/pipeline';
 import { TranslationCoordinator } from '../src/translation/coordinator';
+import { DEFAULT_RULES } from '../src/cleanup/rulesLayer';
 
 const result = (outcome: TranslationResult['outcome']): TranslationResult => ({ text: outcome, outcome });
 
 describe('TranslationCoordinator', () => {
+  it('counts real empty Chinese-detected segments as consecutive failures', async () => {
+    const providerRun = vi.fn();
+    const coordinator = new TranslationCoordinator(
+      (source, detectedLanguage, signal) => runTranslate(source, detectedLanguage, {
+        rules: DEFAULT_RULES,
+        timeoutMs: 300,
+        provider: { name: 'unused', prepare: async () => ({ ok: true }), run: providerRun },
+      }, signal),
+      (source) => source.trim(),
+    );
+
+    for (const [source, detected] of [['', 'zh'], ['  ', 'chinese'], ['\n', 'zh']] as const) {
+      await expect(coordinator.run(source, detected, new AbortController().signal))
+        .resolves.toEqual({ text: '', outcome: 'empty' });
+    }
+    expect(coordinator.isOpen).toBe(true);
+    await expect(coordinator.run('', 'zh', new AbortController().signal))
+      .resolves.toEqual({ text: '', outcome: 'circuit-open' });
+    expect(providerRun).not.toHaveBeenCalled();
+  });
+
   it.each(['timeout', 'error', 'empty', 'rejected'] as const)(
     'counts %s as a failure and opens after three consecutive failures',
     async (failure) => {
