@@ -33,7 +33,15 @@ function snapshot(target: 'off' | 'zh' | 'en' = 'en') {
 
 describe('完整翻译会话快照(t2a)', () => {
   it('采集前复制并冻结 target/sourceHint/useLlm/provider/timeout/rules,后续配置漂移不影响会话', () => {
-    const provider = { name: 'same-instance', cleanup: async (text: string) => text };
+    const provider = {
+      name: 'same-instance',
+      prepare: async () => ({ ok: true as const }),
+      run: async (_instruction: string, text: string) => ({
+        ok: true as const,
+        text,
+        usage: { estimate: true },
+      }),
+    };
     const input = {
       target: 'en' as const,
       sourceHint: 'zh' as const,

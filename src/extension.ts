@@ -38,7 +38,8 @@ import { SegmentPipeline } from './segment/pipeline';
 import { validateSegmentedConfig } from './segment/config';
 import { RulesConfig, applyRules } from './cleanup/rulesLayer';
 import { isRealEditorDocScheme } from './insert/logic';
-import { CleanupCancelled, EnhanceProvider, runCleanup } from './cleanup/pipeline';
+import { CleanupCancelled, runCleanup } from './cleanup/pipeline';
+import { LlmProvider } from './cleanup/llmProvider';
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
 import { CliKind, createCliProvider } from './cleanup/cliProvider';
 import { StatusBar, refreshTranslationTargetOnConfigurationChange } from './ui/statusBar';
@@ -960,10 +961,10 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
 }
 
 /** D9/F3.3 provider 逻辑:auto=rules+vscode.lm(可用则用);CLI 仅显式选择。 */
-async function pickEnhancer(provider: string): Promise<EnhanceProvider | undefined> {
+async function pickEnhancer(provider: string): Promise<LlmProvider | undefined> {
   switch (provider) {
     case 'auto':
-      return createVscodeLmProvider(log); // 无模型 → undefined = rules-only
+      return createVscodeLmProvider(log, extContext.languageModelAccessInformation); // 无模型 → undefined = rules-only
     case 'claude-cli':
     case 'codex-cli':
       return createCliProvider(provider as CliKind);

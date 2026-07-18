@@ -1,4 +1,4 @@
-import type { EnhanceProvider } from '../cleanup/pipeline';
+import type { LlmProvider } from '../cleanup/llmProvider';
 import type { RulesConfig } from '../cleanup/rulesLayer';
 import type { Session } from '../session';
 import type { EngineCapabilities } from '../stt/engineManager';
@@ -10,7 +10,7 @@ export interface TranslationSessionSnapshot {
   readonly target: TranslationTarget;
   readonly sourceHint: WhisperLanguage;
   readonly useLlm: boolean;
-  readonly provider: EnhanceProvider | undefined;
+  readonly provider: LlmProvider | undefined;
   readonly timeoutMs: number;
   readonly rules: Readonly<RulesConfig>;
 }
