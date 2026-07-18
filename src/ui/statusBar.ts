@@ -5,6 +5,7 @@
  */
 import * as vscode from 'vscode';
 import { SessionState } from '../session';
+import type { TranslationTarget } from '../translation/sessionPreflight';
 
 export class StatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
@@ -14,6 +15,7 @@ export class StatusBar implements vscode.Disposable {
   /** P2b:管线中未完成段数(在录 + 在转并行呈现,spec §5.3 修订)。 */
   private pendingSegments = 0;
   private state: SessionState = 'idle';
+  private translationTarget: TranslationTarget = 'off';
 
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
@@ -27,34 +29,40 @@ export class StatusBar implements vscode.Disposable {
     this.stopTimer();
     switch (state) {
       case 'idle':
-        this.item.text = '$(mic) VoiceFlow';
+        this.item.text = `$(mic) VoiceFlow${this.translationBadge()}`;
         this.item.tooltip = 'Ctrl+Alt+L to start dictation';
         this.item.command = 'voiceflow.toggleDictation';
+        this.item.backgroundColor = undefined;
+        break;
+      case 'preparing':
+        this.item.text = `$(loading~spin) VoiceFlow${this.translationBadge()}: Preparing…`;
+        this.item.tooltip = 'Esc to cancel';
+        this.item.command = 'voiceflow.cancelSession';
         this.item.backgroundColor = undefined;
         break;
       case 'recording':
         // 麦克风尚未就绪(helper spawn ~200-300ms):先示"启动中",
         // recordingLive() 后才亮红点计时 —— 否则用户见红即说,开头吞字(gate 实测)
-        this.item.text = '$(loading~spin) VoiceFlow: Starting mic…';
+        this.item.text = `$(loading~spin) VoiceFlow${this.translationBadge()}: Starting mic…`;
         this.item.command = 'voiceflow.cancelSession';
         this.item.tooltip = 'Esc to cancel';
         this.item.backgroundColor = undefined;
         break;
       case 'transcribing':
         this.item.text = this.modelLoading
-          ? '$(loading~spin) VoiceFlow: Loading model…'
-          : '$(loading~spin) VoiceFlow: Transcribing…';
+          ? `$(loading~spin) VoiceFlow${this.translationBadge()}: Loading model…`
+          : `$(loading~spin) VoiceFlow${this.translationBadge()}: Transcribing…`;
         this.item.tooltip = 'Esc to cancel';
         this.item.command = 'voiceflow.cancelSession';
         this.item.backgroundColor = undefined;
         break;
       case 'cleaning':
-        this.item.text = '$(loading~spin) VoiceFlow: Cleaning up…';
+        this.item.text = `$(loading~spin) VoiceFlow${this.translationBadge()}: Cleaning up…`;
         this.item.tooltip = 'Esc to cancel';
         this.item.command = 'voiceflow.cancelSession';
         break;
       case 'inserting':
-        this.item.text = '$(loading~spin) VoiceFlow: Inserting…';
+        this.item.text = `$(loading~spin) VoiceFlow${this.translationBadge()}: Inserting…`;
         this.item.command = undefined;
         break;
       case 'draining':
@@ -64,6 +72,15 @@ export class StatusBar implements vscode.Disposable {
         this.item.backgroundColor = undefined;
         break;
     }
+  }
+
+  setTranslationTarget(target: TranslationTarget): void {
+    this.translationTarget = target;
+    this.setSession(this.state);
+  }
+
+  private translationBadge(): string {
+    return this.translationTarget === 'en' ? ' →英' : this.translationTarget === 'zh' ? ' →中' : '';
   }
 
   /** P2b:段管线活动计数(录音中显示 ✍N;draining 显示剩余)。 */
@@ -76,8 +93,8 @@ export class StatusBar implements vscode.Disposable {
   private renderDraining(): void {
     this.item.text =
       this.pendingSegments > 0
-        ? `$(loading~spin) VoiceFlow: Finishing ${this.pendingSegments} segment(s)…`
-        : '$(loading~spin) VoiceFlow: Finishing…';
+        ? `$(loading~spin) VoiceFlow${this.translationBadge()}: Finishing ${this.pendingSegments} segment(s)…`
+        : `$(loading~spin) VoiceFlow${this.translationBadge()}: Finishing…`;
   }
 
   /** P2c:采集源形态(隐私 UX 评审 v5-⑤:系统音频全程明示,图标/文案区别于麦克风)。 */
@@ -101,7 +118,7 @@ export class StatusBar implements vscode.Disposable {
   setModelLoading(loading: boolean): void {
     this.modelLoading = loading;
     if (loading) {
-      this.item.text = '$(loading~spin) VoiceFlow: Loading model…';
+      this.item.text = `$(loading~spin) VoiceFlow${this.translationBadge()}: Loading model…`;
     }
   }
 
@@ -123,8 +140,8 @@ export class StatusBar implements vscode.Disposable {
     // 系统音频:图标 + SYS 标记全程明示(不是麦克风,评审 v5-⑤)
     this.item.text =
       this.flavor === 'system'
-        ? `$(broadcast) VoiceFlow SYS ${mm}:${ss}${seg}`
-        : `$(record) VoiceFlow ${mm}:${ss}${seg}`;
+        ? `$(broadcast) VoiceFlow${this.translationBadge()} SYS ${mm}:${ss}${seg}`
+        : `$(record) VoiceFlow${this.translationBadge()} ${mm}:${ss}${seg}`;
   }
 
   private stopTimer(): void {

@@ -277,6 +277,53 @@ describe('显式模式(v5-④/v5-①)', () => {
   });
 });
 
+describe('resolveCapabilities(t2a)', () => {
+  it('blocked 记忆命中时按 inprocess small-q8 判定,不被 server turbo 配置误拒', async () => {
+    const w = makeWorld();
+    w.memory.set({ binaryDir: 'X:/bin', binStamp: 'stamp-1' });
+    const m = new EngineManager(cfg({ modelPath: 'X:/ggml-large-v3-turbo.bin' }), w.deps);
+    await expect(m.resolveCapabilities()).resolves.toEqual({
+      engine: 'inprocess',
+      model: 'small-q8',
+      canTranslateToEn: true,
+    });
+    expect(w.runner.prepares).toBe(0);
+    await m.dispose();
+  });
+
+  it('auto + turbo 无 blocked 记忆时先 prepare,发现 blocked 后按 inprocess 能力复判', async () => {
+    const w = makeWorld('blocked-once');
+    const m = new EngineManager(cfg({ modelPath: 'X:/ggml-large-v3-turbo-q5.bin' }), w.deps);
+    await expect(m.resolveCapabilities()).resolves.toEqual({
+      engine: 'inprocess',
+      model: 'small-q8',
+      canTranslateToEn: true,
+    });
+    expect(w.runner.prepares).toBe(1);
+    expect(w.inproc.prepares).toBe(1);
+    await m.dispose();
+  });
+
+  it.each(['server', 'cli'] as const)('显式 %s + turbo 直接返回不支持且不 prepare', async (mode) => {
+    const w = makeWorld();
+    const m = new EngineManager(cfg({ mode, modelPath: 'X:/ggml-large-v3-turbo.bin' }), w.deps);
+    await expect(m.resolveCapabilities()).resolves.toEqual({
+      engine: mode,
+      model: 'large-v3-turbo',
+      canTranslateToEn: false,
+    });
+    expect(w.runner.prepares).toBe(0);
+    await m.dispose();
+  });
+
+  it('能力结果把 q5 文件名归一为配置档位名', async () => {
+    const w = makeWorld();
+    const m = new EngineManager(cfg({ mode: 'server', modelPath: 'X:/ggml-large-v3-turbo-q5_0.bin' }), w.deps);
+    await expect(m.resolveCapabilities()).resolves.toMatchObject({ model: 'large-v3-turbo-q5' });
+    await m.dispose();
+  });
+});
+
 describe('resolveEngineMode(记忆持久化 v4-④ + 准入共用)', () => {
   const stamp = (s: string | undefined) => async (): Promise<string | undefined> => s;
 

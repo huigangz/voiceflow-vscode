@@ -43,6 +43,16 @@ import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
 import { CliKind, createCliProvider } from './cleanup/cliProvider';
 import { StatusBar } from './ui/statusBar';
 import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
+import {
+  SessionPreflight,
+  TranslationSessionSnapshot,
+  TranslationTarget,
+  TranslationUnsupportedError,
+  createTranslationSessionSnapshot,
+  languageHintForSession,
+  transcribeOptionsForSession,
+  validateTranslationSnapshot,
+} from './translation/sessionPreflight';
 
 let output: vscode.OutputChannel;
 let session: Session;
@@ -55,6 +65,12 @@ let insertTarget: InsertTarget = { kind: 'none' };
 let sttAbort: AbortController | undefined;
 let cleaningAbort: AbortController | undefined;
 let statusBar: StatusBar;
+let sessionPreflight: SessionPreflight;
+interface PreparedSession {
+  snapshot: TranslationSessionSnapshot;
+  runner: EngineManager | undefined;
+}
+let preparedSession: PreparedSession | undefined;
 /**
  * P2a 回退链(评审 ⑥/v7-②):addon 首次 start 失败且 code 为 module-unavailable /
  * blocked-by-policy → 当次回退 HelperRecorder,并在运行期记住(按 code,不靠 message)。
@@ -70,6 +86,7 @@ interface SegmentedSession {
   releaseLease: (() => void) | undefined;
   pending: number;
   stopping: boolean;
+  translation: TranslationSessionSnapshot;
 }
 let segmented: SegmentedSession | undefined;
 
@@ -121,8 +138,12 @@ export function activate(context: vscode.ExtensionContext): void {
   extContext = context;
   output = vscode.window.createOutputChannel('VoiceFlow');
   session = new Session();
+  sessionPreflight = new SessionPreflight(session);
 
   statusBar = new StatusBar();
+  statusBar.setTranslationTarget(
+    vscode.workspace.getConfiguration('voiceflow').get<TranslationTarget>('translate.target', 'off'),
+  );
 
   session.onTransition((state, prev) => {
     log(`[session] ${prev} -> ${state}`);
@@ -283,6 +304,7 @@ function buildController(recorder: Recorder, cfg: vscode.WorkspaceConfiguration)
     statusBar.showError(`Recording failed: ${err.code}`);
     recording?.dispose();
     recording = undefined;
+    preparedSession = undefined;
     void showRecorderError(err);
   };
   return controller;
@@ -344,15 +366,59 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
   return startBatchSession(cfg, focusHint);
 }
 
+function captureTranslationSnapshot(cfg: vscode.WorkspaceConfiguration): TranslationSessionSnapshot {
+  return createTranslationSessionSnapshot({
+    target: cfg.get<TranslationTarget>('translate.target', 'off'),
+    sourceHint: cfg.get<'zh' | 'en' | 'auto'>('language', 'auto'),
+    useLlm: cfg.get<boolean>('translate.useLlm', false),
+    provider: undefined,
+    timeoutMs: cfg.get<number>('cleanup.timeout', 8000),
+    rules: getRulesConfig(),
+  });
+}
+
+/** Freeze translation privacy/routing inputs, then move preparing → recording only for this generation. */
+async function prepareSession(cfg: vscode.WorkspaceConfiguration): Promise<PreparedSession | undefined> {
+  const snapshot = captureTranslationSnapshot(cfg);
+  statusBar.setTranslationTarget(snapshot.target);
+  // off 保持同步穿透:不引入一次 await 的焦点快照漂移,也不让 preparing spinner 可见。
+  if (snapshot.target === 'off') {
+    if (!session.dispatch('prepare')) return undefined;
+    session.dispatch('start');
+    return { snapshot, runner: undefined };
+  }
+  let resolvedRunner: EngineManager | undefined;
+  try {
+    const result = await sessionPreflight.run(async (signal) => {
+      await validateTranslationSnapshot(snapshot, {
+        resolveCapabilities: async () => {
+          resolvedRunner = await getWhisper();
+          return resolvedRunner.resolveCapabilities();
+        },
+      }, signal);
+      return { snapshot, runner: resolvedRunner };
+    });
+    return result.started ? result.value : undefined;
+  } catch (error) {
+    const message = error instanceof TranslationUnsupportedError ? error.message : String(error);
+    statusBar.showError('Translation preflight failed');
+    log(`[translation] preflight failed: ${message}`);
+    void vscode.window.showErrorMessage(`VoiceFlow: ${message}`);
+    return undefined;
+  }
+}
+
 async function startBatchSession(
   cfg: vscode.WorkspaceConfiguration,
   focusHint: FocusHint,
 ): Promise<void> {
+  const prepared = await prepareSession(cfg);
+  if (!prepared) return;
+  preparedSession = prepared;
   // F4:插入目标在录音开始时锁定
   insertTarget = captureTarget(focusHint);
   log(`[dictation] target locked: ${insertTarget.kind}`);
   if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
-  session.dispatch('start');
   try {
     recording = await startWithRecorderFallback(cfg, (r) => buildController(r, cfg));
     statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
@@ -361,6 +427,7 @@ async function startBatchSession(
     statusBar.showError('Failed to start recording');
     recording?.dispose();
     recording = undefined;
+    preparedSession = undefined;
     disposeFocusedInputTracker(); // v5-① 挂点①:启动失败不经处理流程 finally
     if (err instanceof RecorderError) void showRecorderError(err);
     else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
@@ -415,16 +482,28 @@ async function startSegmentedSession(
     void vscode.window.showErrorMessage(`VoiceFlow: ${valid.error}`);
     return;
   }
+  const prepared = await prepareSession(cfg);
+  if (!prepared) return;
+
   // ② 形态准入(评审 v8-⑤:CLI 显式拒绝不静默降级;v10-③/v11-⑤:快速判定不碰模型;
   //    inproc-s4/§3.5:准入从"server"放宽为"server 或 inprocess"——两者常驻、无每段冷加载)
   const binaryDir = whisperBinaryDir(cfg);
-  const engineMode = await resolveEngineMode({
-    mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
-    binaryDir,
-    serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
-    memory: blockedMemory(),
-  });
+  let engineMode: 'server' | 'cli' | 'inprocess';
+  try {
+    engineMode = await resolveEngineMode({
+      mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
+      binaryDir,
+      serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
+      memory: blockedMemory(),
+    });
+  } catch (error) {
+    session.dispatch('error');
+    statusBar.showError('Whisper preflight failed');
+    void vscode.window.showErrorMessage(`VoiceFlow: failed to inspect whisper engine — ${String(error)}`);
+    return;
+  }
   if (engineMode === 'cli') {
+    session.dispatch('error');
     statusBar.showError('Segmented requires whisper server');
     void vscode.window.showErrorMessage(
       'VoiceFlow: segmented mode requires the whisper server binary (per-segment CLI cold-load latency is unacceptable). ' +
@@ -448,7 +527,7 @@ async function startSegmentedSession(
 
   // ③ 并行预热(评审 v6-⑥):会话 lease 先行(v11-②);prepare 失败不阻会话,首段会再试
   const warmup = (async () => {
-    const runner = await getWhisper(); // 含模型确保(首次可能下载)
+    const runner = prepared.runner ?? await getWhisper(); // 翻译会话复用 preflight 冻结的引擎代际
     const release = runner.acquireLease();
     runner.prepare().catch((e: unknown) =>
       log(`[whisper] warmup failed (first segment will retry): ${String((e as Error)?.message ?? e)}`),
@@ -463,23 +542,28 @@ async function startSegmentedSession(
     releaseLease: undefined,
     pending: 0,
     stopping: false,
+    translation: prepared.snapshot,
   };
   warmup.then(
     ({ release }) => { seg.releaseLease = release; },
     () => { /* 预热失败:首段 transcribe 走同一失败路径(fatal 显式终止) */ },
   );
 
-  const rulesCfg = getRulesConfig();
+  const rulesCfg = prepared.snapshot.rules as RulesConfig;
   // 会话语言锁定(评审 ⑤ + v9-⑦):仅 language=auto 参与;首个语音 ≥2s 的段锁定(过短首段不锁);
   // detected_language 拿不到(如 CLI)则维持逐段 auto。锁定状态由管线闭包持有,不污染 cfg。
-  const baseLanguage = cfg.get<'zh' | 'en' | 'auto'>('language', 'auto');
+  const baseLanguage = prepared.snapshot.sourceHint;
   let lockedLanguage: 'zh' | 'en' | undefined;
   let firstSegmentDone = false;
   const MIN_LOCK_SPEECH_MS = 2000;
   const pipeline = new SegmentPipeline({
     transcribe: async (wav, signal, s) => {
       const { runner } = await warmup;
-      const r = await runner.transcribe(wav, { signal, language: lockedLanguage });
+      const r = await runner.transcribe(wav, {
+        ...transcribeOptionsForSession(prepared.snapshot),
+        signal,
+        language: languageHintForSession(prepared.snapshot, lockedLanguage),
+      });
       // 首段 cold latency 单列(评审 v6-⑥,不计入 P50/P95)
       log(
         `[metrics] segment #${s.index}${firstSegmentDone ? '' : ' (first)'} ` +
@@ -487,7 +571,12 @@ async function startSegmentedSession(
           `lang=${lockedLanguage ?? baseLanguage}${r.detectedLanguage ? ` detected=${r.detectedLanguage}` : ''}`,
       );
       firstSegmentDone = true;
-      if (baseLanguage === 'auto' && lockedLanguage === undefined && s.speechMs >= MIN_LOCK_SPEECH_MS) {
+      if (
+        prepared.snapshot.target === 'off' &&
+        baseLanguage === 'auto' &&
+        lockedLanguage === undefined &&
+        s.speechMs >= MIN_LOCK_SPEECH_MS
+      ) {
         // v4-⑦ 唯一映射点:server('chinese'/'english')与 inprocess('zh'/'en')双词汇归一
         const mapped = normalizeDetectedLanguage(r.detectedLanguage);
         if (mapped) {
@@ -530,7 +619,6 @@ async function startSegmentedSession(
       ? cfg.get<number>('systemAudio.maxDuration', 1800)
       : cfg.get<number>('recording.maxDuration', 120)) * 1000;
 
-  session.dispatch('start');
   try {
     const buildSegController = (r: Recorder): SegmentedRecordingController => {
       const c = new SegmentedRecordingController(
@@ -667,9 +755,15 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     }
 
     // Step 2:whisper 转写(埋点:cold start 与 warm 分开,§8.1)
-    const runner = await getWhisper();
+    const activeTranslation = preparedSession;
+    const snapshot = activeTranslation?.snapshot ?? captureTranslationSnapshot(vscode.workspace.getConfiguration('voiceflow'));
+    const runner = activeTranslation?.runner ?? await getWhisper();
     sttAbort = new AbortController();
-    const stt = await runner.transcribe(result.wavUri.fsPath, { signal: sttAbort.signal });
+    const stt = await runner.transcribe(result.wavUri.fsPath, {
+      ...transcribeOptionsForSession(snapshot),
+      signal: sttAbort.signal,
+      language: snapshot.target === 'off' ? undefined : snapshot.sourceHint,
+    });
     sttAbort = undefined;
     if ((session.state as string) !== 'transcribing') return; // Esc 已取消
     log(
@@ -684,9 +778,11 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     const cleanResult = await runCleanup(
       stt.text,
       {
-        rules: getRulesConfig(),
-        timeoutMs: vfCfg.get<number>('cleanup.timeout', 8000),
-        enhancer: await pickEnhancer(vfCfg.get<string>('cleanup.provider', 'auto')),
+        rules: snapshot.target === 'off' ? getRulesConfig() : snapshot.rules as RulesConfig,
+        timeoutMs: snapshot.target === 'off' ? vfCfg.get<number>('cleanup.timeout', 8000) : snapshot.timeoutMs,
+        enhancer: snapshot.target === 'off'
+          ? await pickEnhancer(vfCfg.get<string>('cleanup.provider', 'auto'))
+          : snapshot.provider,
         log,
       },
       cleaningAbort.signal,
@@ -754,6 +850,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
   } finally {
     recording?.dispose();
     recording = undefined;
+    preparedSession = undefined;
     disposeFocusedInputTracker(); // v5-① 挂点③:转写失败/空文本/Copy/Discard/正常完成全收口
     // 临时 WAV 用完即删(隐私:音频不留盘)
     if (wavUri) {
@@ -790,6 +887,12 @@ function getRulesConfig(): RulesConfig {
 
 function cancelSession(): void {
   if (!session.active) return;
+  if (session.state === 'preparing') {
+    sessionPreflight.cancel();
+    preparedSession = undefined;
+    log('[dictation] session preflight wait cancelled (Esc)');
+    return;
+  }
   if (segmented) {
     // 分段 Esc 语义(spec §5.3 修订):停录 + abort 在途 + 删未提交段文件,已插入的段不回收;
     // 已完成未插入的累计文本先 flush(v4-② Esc 路径)
@@ -801,6 +904,7 @@ function cancelSession(): void {
   recording?.cancel();
   recording?.dispose();
   recording = undefined;
+  preparedSession = undefined;
   disposeFocusedInputTracker(); // v5-① 挂点②:录音期 Esc 不经处理流程 finally
   sttAbort?.abort(); // 中止进行中的转写(CLI kill / HTTP abort;server 进程保留,v10-① 双信号)
   sttAbort = undefined;
@@ -832,6 +936,7 @@ async function showRecorderError(err: RecorderError): Promise<void> {
 }
 
 export function deactivate(): Promise<void> | undefined {
+  if (session?.state === 'preparing') sessionPreflight.cancel();
   recording?.dispose();
   recording = undefined;
   if (segmented) {

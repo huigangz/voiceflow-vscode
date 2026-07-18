@@ -45,6 +45,12 @@ export interface EngineManagerDeps {
 /** manager 视角的运行模式(resolveEngineMode 的输出)。 */
 export type EngineMode = 'server' | 'cli' | 'inprocess';
 
+export interface EngineCapabilities {
+  engine: EngineMode;
+  model: string;
+  canTranslateToEn: boolean;
+}
+
 export interface ResolveEngineModeOpts {
   mode: EngineMode | 'auto';
   binaryDir: string;
@@ -121,6 +127,16 @@ export class EngineManager implements WhisperEngine {
     }
   }
 
+  /** 解析最终 backend/model;auto 的不支持映射须先 prepare,给 blocked 回退一次发现机会。 */
+  async resolveCapabilities(): Promise<EngineCapabilities> {
+    let capabilities = this.capabilitiesFor(await this.resolveMode());
+    if (this.cfg.mode === 'auto' && !capabilities.canTranslateToEn) {
+      await this.prepare();
+      capabilities = this.capabilitiesFor(await this.resolveMode());
+    }
+    return capabilities;
+  }
+
   async transcribe(wavPath: string, opts: TranscribeOptions = {}): Promise<TranscribeResult> {
     const mode = await this.resolveMode();
     if (mode === 'inprocess') {
@@ -150,6 +166,17 @@ export class EngineManager implements WhisperEngine {
       memory: this.deps.memory,
       blockedThisRun: this.blockedThisRun,
     });
+  }
+
+  private capabilitiesFor(engine: EngineMode): EngineCapabilities {
+    const model = engine === 'inprocess'
+      ? this.deps.inprocessTier()
+      : this.cfg.modelPath
+          .split(/[\\/]/).at(-1)
+          ?.replace(/^ggml-/, '')
+          .replace(/\.bin$/, '')
+          .replace(/-q5_[01]$/, '-q5') ?? this.cfg.modelPath;
+    return { engine, model, canTranslateToEn: engine === 'inprocess' || !model.includes('turbo') };
   }
 
   // ---------- 回退协议(v4-③/v5-②)----------

@@ -1,8 +1,8 @@
 /**
  * 会话状态机(spec §5.3,P2b 修订)— 纯逻辑,不依赖 vscode,可单元测试。
  *
- *   batch:     idle → recording → transcribing → cleaning → inserting → idle
- *   segmented: idle → recording → draining → idle
+ *   batch:     idle → preparing → recording → transcribing → cleaning → inserting → idle
+ *   segmented: idle → preparing → recording → draining → idle
  *              (recording 期间段处理子活动并行于管线内,不是会话状态;
  *               draining = 录音已停、FIFO 内剩余段仍在转写/插入,评审 ④"drain 完再回 idle")
  *
@@ -12,6 +12,7 @@
 
 export type SessionState =
   | 'idle'
+  | 'preparing'
   | 'recording'
   | 'transcribing'
   | 'cleaning'
@@ -19,7 +20,8 @@ export type SessionState =
   | 'draining';
 
 export type SessionEvent =
-  | 'start'        // Ctrl+Alt+L,仅 idle 时有效
+  | 'prepare'      // Ctrl+Alt+L,仅 idle 时有效
+  | 'start'        // preflight 完成,仅 preparing 时有效
   | 'stopRecording'// Ctrl+Alt+L 再按 / VAD 静音 / 超时(batch)
   | 'transcribed'
   | 'cleaned'
@@ -30,7 +32,8 @@ export type SessionEvent =
   | 'error';
 
 const TRANSITIONS: Record<SessionState, Partial<Record<SessionEvent, SessionState>>> = {
-  idle: { start: 'recording' },
+  idle: { prepare: 'preparing' },
+  preparing: { start: 'recording', cancel: 'idle', error: 'idle' },
   recording: { stopRecording: 'transcribing', drainStart: 'draining', cancel: 'idle', error: 'idle' },
   transcribing: { transcribed: 'cleaning', cancel: 'idle', error: 'idle' },
   cleaning: { cleaned: 'inserting', cancel: 'idle', error: 'idle' },

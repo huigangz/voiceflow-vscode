@@ -115,6 +115,16 @@
           "default": "auto",
           "description": "Dictation language. auto = auto-detect (recommended; handles English, Chinese, and mixed correctly); zh = force Chinese; en = force English. Note: zh will translate pure-English speech into Chinese."
         },
+        "voiceflow.translate.target": {
+          "type": "string",
+          "enum": [
+            "off",
+            "zh",
+            "en"
+          ],
+          "default": "off",
+          "description": "Translation target. off = normal dictation; en = fully local Whisper translation. zh is reserved for the LLM translation layer."
+        },
         "voiceflow.model": {
           "type": "string",
           "enum": [
