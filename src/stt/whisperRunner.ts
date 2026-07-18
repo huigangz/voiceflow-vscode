@@ -76,7 +76,7 @@ export interface TranscribeOptions {
   /** Whisper 原生任务。translate 仅用于本地任意语言 → English。 */
   task?: 'transcribe' | 'translate';
   /** 能力路由标记;当前原生翻译仅支持 English。 */
-  translationTarget?: 'zh' | 'en';
+  translationTarget?: 'en';
 }
 
 export interface TranscribeResult {

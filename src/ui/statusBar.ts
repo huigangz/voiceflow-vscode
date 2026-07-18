@@ -7,6 +7,15 @@ import * as vscode from 'vscode';
 import { SessionState } from '../session';
 import type { TranslationTarget } from '../translation/sessionPreflight';
 
+export function refreshTranslationTargetOnConfigurationChange(
+  event: { affectsConfiguration(section: string): boolean },
+  isIdle: () => boolean,
+  readTarget: () => TranslationTarget,
+  setTarget: (target: TranslationTarget) => void,
+): void {
+  if (isIdle() && event.affectsConfiguration('voiceflow.translate.target')) setTarget(readTarget());
+}
+
 export class StatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
   private timer: NodeJS.Timeout | undefined;

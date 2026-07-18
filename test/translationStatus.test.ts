@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as vscode from 'vscode';
-import { StatusBar } from '../src/ui/statusBar';
+import { StatusBar, refreshTranslationTargetOnConfigurationChange } from '../src/ui/statusBar';
 
 interface FakeItem { text: string; tooltip?: string; command?: string; backgroundColor?: unknown; }
 
@@ -47,4 +47,32 @@ describe('翻译状态栏矩阵(t2a,v3-⑤)', () => {
       bar.dispose();
     },
   );
+
+  it('idle 时 translate.target 配置变化立即刷新徽标,无关配置不刷新', () => {
+    const bar = new StatusBar();
+    let target: 'off' | 'zh' | 'en' = 'off';
+    let reads = 0;
+    const read = () => { reads++; return target; };
+    refreshTranslationTargetOnConfigurationChange(
+      { affectsConfiguration: () => false }, () => true, read, (value) => bar.setTranslationTarget(value),
+    );
+    expect(reads).toBe(0);
+    target = 'en';
+    refreshTranslationTargetOnConfigurationChange(
+      { affectsConfiguration: (key) => key === 'voiceflow.translate.target' },
+      () => true,
+      read,
+      (value) => bar.setTranslationTarget(value),
+    );
+    expect(reads).toBe(1);
+    expect(item.text).toContain('→英');
+
+    target = 'zh';
+    refreshTranslationTargetOnConfigurationChange(
+      { affectsConfiguration: () => true }, () => false, read, (value) => bar.setTranslationTarget(value),
+    );
+    expect(reads).toBe(1);
+    expect(item.text).toContain('→英');
+    bar.dispose();
+  });
 });

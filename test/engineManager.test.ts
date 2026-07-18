@@ -304,6 +304,19 @@ describe('resolveCapabilities(t2a)', () => {
     await m.dispose();
   });
 
+  it('auto 解析为 CLI + turbo 时直接判不支持,不调用 server prepare', async () => {
+    const w = makeWorld();
+    w.binStamp = undefined;
+    const m = new EngineManager(cfg({ modelPath: 'X:/ggml-large-v3-turbo.bin' }), w.deps);
+    await expect(m.resolveCapabilities()).resolves.toEqual({
+      engine: 'cli',
+      model: 'large-v3-turbo',
+      canTranslateToEn: false,
+    });
+    expect(w.runner.prepares).toBe(0);
+    await m.dispose();
+  });
+
   it.each(['server', 'cli'] as const)('显式 %s + turbo 直接返回不支持且不 prepare', async (mode) => {
     const w = makeWorld();
     const m = new EngineManager(cfg({ mode, modelPath: 'X:/ggml-large-v3-turbo.bin' }), w.deps);

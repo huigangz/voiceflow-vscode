@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { buildCliArgs, parseServerResponse } from '../src/stt/whisperRunner';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import { buildCliArgs, parseServerResponse, TranscribeOptions } from '../src/stt/whisperRunner';
 
 describe('whisperRunner 纯逻辑', () => {
+  it('原生 translationTarget 类型只允许 English', () => {
+    expectTypeOf<NonNullable<TranscribeOptions['translationTarget']>>().toEqualTypeOf<'en'>();
+  });
   it('CLI 参数包含模型/文件/语言/引导 prompt,禁时间戳', () => {
     const args = buildCliArgs({
       modelPath: 'C:\\m\\ggml-small.bin',

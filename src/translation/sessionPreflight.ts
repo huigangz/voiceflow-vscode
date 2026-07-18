@@ -63,6 +63,37 @@ export type SessionPreflightResult<T> =
   | { started: true; value: T }
   | { started: false; reason: 'busy' | 'cancelled' };
 
+/**
+ * Keep one preflight generation across asynchronous admission and recorder startup.
+ * Cancellation abandons admission before capture; a resource produced late is disposed exactly once.
+ */
+export async function runCancellableStartup<A, R>(
+  preflight: SessionPreflight,
+  admit: (signal: AbortSignal) => Promise<A>,
+  start: (admission: A, signal: AbortSignal) => Promise<R>,
+  disposeLate: (resource: R) => void,
+): Promise<SessionPreflightResult<R>> {
+  let resource: R | undefined;
+  let disposed = false;
+  const dispose = (value: R): void => {
+    if (disposed) return;
+    disposed = true;
+    disposeLate(value);
+  };
+  const result = await preflight.run(async (signal) => {
+    const admission = await admit(signal);
+    if (signal.aborted) throw new Error('startup cancelled after admission');
+    resource = await start(admission, signal);
+    if (signal.aborted) {
+      dispose(resource);
+      throw new Error('startup cancelled after recorder start');
+    }
+    return resource;
+  });
+  if (!result.started && resource !== undefined) dispose(resource);
+  return result;
+}
+
 /** Owns one session-level preflight generation; cancelling abandons the wait, not shared startup. */
 export class SessionPreflight {
   private generation = 0;

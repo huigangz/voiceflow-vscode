@@ -5,6 +5,7 @@ import {
   TranslationUnsupportedError,
   createTranslationSessionSnapshot,
   languageHintForSession,
+  runCancellableStartup,
   transcribeOptionsForSession,
   validateTranslationSnapshot,
 } from '../src/translation/sessionPreflight';
@@ -108,5 +109,47 @@ describe('翻译 preflight 编排(t2a)', () => {
     await expect(validateTranslationSnapshot(snapshot('en'), {
       resolveCapabilities: async () => ({ engine: 'server' as const, model: 'large-v3-turbo', canTranslateToEn: false }),
     }, new AbortController().signal)).rejects.toBeInstanceOf(TranslationUnsupportedError);
+  });
+
+  it('分段 admission 等待中 Esc:晚到完成不得启动采集或进入 recording', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let release!: () => void;
+    const gate = new Promise<string>((resolve) => { release = () => resolve('admitted'); });
+    let starts = 0;
+    const startup = runCancellableStartup(
+      preflight,
+      async () => gate,
+      async () => { starts++; return { dispose() {} }; },
+      (resource) => resource.dispose(),
+    );
+    expect(session.state).toBe('preparing');
+    expect(preflight.cancel()).toBe(true);
+    release();
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(starts).toBe(0);
+    expect(session.state).toBe('idle');
+  });
+
+  it('采集 start 等待中 Esc:晚到 controller/lease 立即释放', async () => {
+    const session = new Session();
+    const preflight = new SessionPreflight(session);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let disposed = 0;
+    const startup = runCancellableStartup(
+      preflight,
+      async () => 'admitted',
+      async () => { await gate; return { dispose: () => { disposed++; } }; },
+      (resource) => resource.dispose(),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(preflight.cancel()).toBe(true);
+    await expect(startup).resolves.toEqual({ started: false, reason: 'cancelled' });
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposed).toBe(1);
+    expect(session.state).toBe('idle');
   });
 });

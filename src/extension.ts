@@ -41,7 +41,7 @@ import { isRealEditorDocScheme } from './insert/logic';
 import { CleanupCancelled, EnhanceProvider, runCleanup } from './cleanup/pipeline';
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
 import { CliKind, createCliProvider } from './cleanup/cliProvider';
-import { StatusBar } from './ui/statusBar';
+import { StatusBar, refreshTranslationTargetOnConfigurationChange } from './ui/statusBar';
 import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
 import {
   SessionPreflight,
@@ -50,6 +50,7 @@ import {
   TranslationUnsupportedError,
   createTranslationSessionSnapshot,
   languageHintForSession,
+  runCancellableStartup,
   transcribeOptionsForSession,
   validateTranslationSnapshot,
 } from './translation/sessionPreflight';
@@ -87,6 +88,7 @@ interface SegmentedSession {
   pending: number;
   stopping: boolean;
   translation: TranslationSessionSnapshot;
+  disposed: boolean;
 }
 let segmented: SegmentedSession | undefined;
 
@@ -164,6 +166,16 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output,
     statusBar,
+    vscode.workspace.onDidChangeConfiguration((event) =>
+      refreshTranslationTargetOnConfigurationChange(
+        event,
+        () => session.state === 'idle',
+        () => vscode.workspace
+          .getConfiguration('voiceflow')
+          .get<TranslationTarget>('translate.target', 'off'),
+        (target) => statusBar.setTranslationTarget(target),
+      ),
+    ),
     vscode.commands.registerCommand('voiceflow.toggleDictation', toggleDictation),
     vscode.commands.registerCommand('voiceflow.cancelSession', cancelSession),
     vscode.commands.registerCommand('voiceflow.showLogs', () => output.show()),
@@ -482,39 +494,67 @@ async function startSegmentedSession(
     void vscode.window.showErrorMessage(`VoiceFlow: ${valid.error}`);
     return;
   }
-  const prepared = await prepareSession(cfg);
-  if (!prepared) return;
-
-  // ② 形态准入(评审 v8-⑤:CLI 显式拒绝不静默降级;v10-③/v11-⑤:快速判定不碰模型;
-  //    inproc-s4/§3.5:准入从"server"放宽为"server 或 inprocess"——两者常驻、无每段冷加载)
-  const binaryDir = whisperBinaryDir(cfg);
-  let engineMode: 'server' | 'cli' | 'inprocess';
+  const snapshot = captureTranslationSnapshot(cfg);
+  statusBar.setTranslationTarget(snapshot.target);
+  let resolvedRunner: EngineManager | undefined;
   try {
-    engineMode = await resolveEngineMode({
-      mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
-      binaryDir,
-      serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
-      memory: blockedMemory(),
-    });
-  } catch (error) {
-    session.dispatch('error');
-    statusBar.showError('Whisper preflight failed');
-    void vscode.window.showErrorMessage(`VoiceFlow: failed to inspect whisper engine — ${String(error)}`);
-    return;
-  }
-  if (engineMode === 'cli') {
-    session.dispatch('error');
-    statusBar.showError('Segmented requires whisper server');
-    void vscode.window.showErrorMessage(
-      'VoiceFlow: segmented mode requires the whisper server binary (per-segment CLI cold-load latency is unacceptable). ' +
-        'Restore whisper-server.exe or set "voiceflow.output.mode" back to "batch".',
+    const result = await runCancellableStartup(
+      sessionPreflight,
+      async (signal) => {
+        await validateTranslationSnapshot(snapshot, {
+          resolveCapabilities: async () => {
+            resolvedRunner = await getWhisper();
+            return resolvedRunner.resolveCapabilities();
+          },
+        }, signal);
+        if (signal.aborted) throw new Error('segmented admission cancelled');
+        // ② 形态准入也属于同一 preparing 代际;Esc 后晚到结果不得开始采集。
+        const binaryDir = whisperBinaryDir(cfg);
+        const engineMode = await resolveEngineMode({
+          mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
+          binaryDir,
+          serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
+          memory: blockedMemory(),
+        });
+        if (engineMode === 'cli') {
+          throw new TranslationUnsupportedError(
+            'Segmented mode requires the whisper server or in-process engine. Restore whisper-server.exe or use batch mode.',
+          );
+        }
+        return { snapshot, runner: resolvedRunner };
+      },
+      (prepared, signal) => startSegmentedCapture(
+        cfg,
+        focusHint,
+        opts,
+        prepared,
+        valid.segmentPauseMs,
+        autoStopSilenceS,
+        signal,
+      ),
+      disposeSegmentedResources,
     );
-    return;
+    if (!result.started) return;
+    statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
+  } catch (err) {
+    statusBar.showError('Failed to start recording');
+    if (err instanceof RecorderError) void showRecorderError(err);
+    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
   }
+}
 
+async function startSegmentedCapture(
+  cfg: vscode.WorkspaceConfiguration,
+  focusHint: FocusHint,
+  opts: { systemAudio?: boolean },
+  prepared: PreparedSession,
+  segmentPauseMs: number,
+  autoStopSilenceS: number,
+  signal: AbortSignal,
+): Promise<SegmentedSession> {
+  if (signal.aborted) throw new Error('segmented startup cancelled before capture');
   insertTarget = captureTarget(focusHint);
   log(`[dictation] target locked: ${insertTarget.kind} (segmented)`);
-  // chat-insert v6-B:focused-input 逐段累计(同 none),正常结束单次注入(dispatch 全套判定)
   if (insertTarget.kind === 'focused-input') armFocusedInputTracker();
   const inserter = new SegmentInserter(insertTarget, log, async (text) => {
     const fiOpts = focusedInputOpts();
@@ -525,9 +565,9 @@ async function startSegmentedSession(
     await dispatchInsert({ kind: 'focused-input' }, text, fiOpts);
   });
 
-  // ③ 并行预热(评审 v6-⑥):会话 lease 先行(v11-②);prepare 失败不阻会话,首段会再试
+  // Preserve off-mode parallel warmup. If it resolves after cancellation, release its lease immediately.
   const warmup = (async () => {
-    const runner = prepared.runner ?? await getWhisper(); // 翻译会话复用 preflight 冻结的引擎代际
+    const runner = prepared.runner ?? await getWhisper();
     const release = runner.acquireLease();
     runner.prepare().catch((e: unknown) =>
       log(`[whisper] warmup failed (first segment will retry): ${String((e as Error)?.message ?? e)}`),
@@ -543,28 +583,29 @@ async function startSegmentedSession(
     pending: 0,
     stopping: false,
     translation: prepared.snapshot,
+    disposed: false,
   };
   warmup.then(
-    ({ release }) => { seg.releaseLease = release; },
-    () => { /* 预热失败:首段 transcribe 走同一失败路径(fatal 显式终止) */ },
+    ({ release }) => {
+      if (signal.aborted || segmented !== seg || seg.disposed) release();
+      else seg.releaseLease = release;
+    },
+    () => { /* 首段 transcribe 走同一失败路径 */ },
   );
 
   const rulesCfg = prepared.snapshot.rules as RulesConfig;
-  // 会话语言锁定(评审 ⑤ + v9-⑦):仅 language=auto 参与;首个语音 ≥2s 的段锁定(过短首段不锁);
-  // detected_language 拿不到(如 CLI)则维持逐段 auto。锁定状态由管线闭包持有,不污染 cfg。
   const baseLanguage = prepared.snapshot.sourceHint;
   let lockedLanguage: 'zh' | 'en' | undefined;
   let firstSegmentDone = false;
   const MIN_LOCK_SPEECH_MS = 2000;
   const pipeline = new SegmentPipeline({
-    transcribe: async (wav, signal, s) => {
+    transcribe: async (wav, segmentSignal, s) => {
       const { runner } = await warmup;
       const r = await runner.transcribe(wav, {
         ...transcribeOptionsForSession(prepared.snapshot),
-        signal,
+        signal: segmentSignal,
         language: languageHintForSession(prepared.snapshot, lockedLanguage),
       });
-      // 首段 cold latency 单列(评审 v6-⑥,不计入 P50/P95)
       log(
         `[metrics] segment #${s.index}${firstSegmentDone ? '' : ' (first)'} ` +
           `cold=${r.coldStartMs ?? 0}ms warm=${r.transcribeMs}ms ` +
@@ -577,7 +618,6 @@ async function startSegmentedSession(
         lockedLanguage === undefined &&
         s.speechMs >= MIN_LOCK_SPEECH_MS
       ) {
-        // v4-⑦ 唯一映射点:server('chinese'/'english')与 inprocess('zh'/'en')双词汇归一
         const mapped = normalizeDetectedLanguage(r.detectedLanguage);
         if (mapped) {
           lockedLanguage = mapped;
@@ -586,10 +626,10 @@ async function startSegmentedSession(
       }
       return r.text;
     },
-    cleanup: (raw) => applyRules(raw, rulesCfg), // v1:分段只做规则清理(D2 定 LLM 是否按段开)
+    cleanup: (raw) => applyRules(raw, rulesCfg),
     insert: async (text) => inserter.insertSegment(text),
     deleteWav: async (p) => {
-      seg.pending = Math.max(0, seg.pending - 1); // 每段恰好删一次(成败同待遇)→ 计数在此收敛
+      seg.pending = Math.max(0, seg.pending - 1);
       statusBar.setSegmentActivity(seg.pending);
       try {
         await vscode.workspace.fs.delete(vscode.Uri.file(p));
@@ -597,14 +637,12 @@ async function startSegmentedSession(
     },
     log,
     onFatal: (err) => {
-      // 显式终止(评审 ③):停录 + 状态栏错误 + flush 兜底,绝不静默缺句
       statusBar.showError('Dictation failed');
       void vscode.window.showErrorMessage(`VoiceFlow: ${err.message}`);
-      inserter.flushFallback('fatal'); // 错误路径销毁管线前先 flush(v4-②)
+      inserter.flushFallback('fatal');
       teardownSegmented('error');
     },
     onBacklogLimit: () => {
-      // v12-②:停采集,已入队段照常 drain 全部出字
       void vscode.window.showWarningMessage(
         'VoiceFlow: transcription is falling behind — recording stopped early. Queued segments will still be inserted.',
       );
@@ -612,64 +650,56 @@ async function startSegmentedSession(
     },
   });
   seg.pipeline = pipeline;
+  // Ownership is visible before recorder.start():Esc can now cancel/dispose an in-progress startup.
+  segmented = seg;
 
-  // D6:系统音频独立会话上限(默认 30min;分段管线段完即插即删,长会话内存平稳)
   const maxDurationMs =
     (opts.systemAudio
       ? cfg.get<number>('systemAudio.maxDuration', 1800)
       : cfg.get<number>('recording.maxDuration', 120)) * 1000;
+  const buildSegController = (r: Recorder): SegmentedRecordingController => {
+    const c = new SegmentedRecordingController(
+      r,
+      { maxDurationMs, autoStopSilenceMs: autoStopSilenceS * 1000 },
+      segmentPauseMs,
+      extContext.globalStorageUri,
+      log,
+      { maxSegmentMs: 20_000 },
+    );
+    seg.controller = c;
+    c.onSegment = (s) => {
+      seg.pending++;
+      statusBar.setSegmentActivity(seg.pending);
+      pipeline.enqueue({
+        wavPath: s.wavUri.fsPath,
+        index: s.index,
+        startMs: s.startMs,
+        endMs: s.endMs,
+        speechMs: s.speechMs,
+      });
+    };
+    c.onSegmentError = (err) => {
+      statusBar.showError('Dictation failed');
+      void vscode.window.showErrorMessage(`VoiceFlow: failed to persist a segment — ${err.message}`);
+      inserter.flushFallback('segment-write-failed');
+      teardownSegmented('error');
+    };
+    c.onAutoStop = (reason) => {
+      log(`[recording] auto-stop: ${reason}`);
+      void stopSegmentedSession(reason);
+    };
+    c.onError = (err) => {
+      log(`[recording] failed: ${err.code} — ${err.message}`);
+      inserter.flushFallback('device-lost');
+      statusBar.showError(`Recording failed: ${err.code}`);
+      teardownSegmented('error');
+      void showRecorderError(err);
+    };
+    return c;
+  };
 
   try {
-    const buildSegController = (r: Recorder): SegmentedRecordingController => {
-      const c = new SegmentedRecordingController(
-        r,
-        {
-          maxDurationMs,
-          autoStopSilenceMs: autoStopSilenceS * 1000,
-        },
-        valid.segmentPauseMs,
-        extContext.globalStorageUri,
-        log,
-        // 强制切分 20s(P2c gate 实测:连续解说无停顿 → 段膨胀触发 backlog 停采;
-        // 对口述同样防长独白撑爆;whisper 30s 窗内,20s 段 warm ~6s 管线稳跟)
-        { maxSegmentMs: 20_000 },
-      );
-      c.onSegment = (s) => {
-        seg.pending++;
-        statusBar.setSegmentActivity(seg.pending);
-        pipeline.enqueue({
-          wavPath: s.wavUri.fsPath,
-          index: s.index,
-          startMs: s.startMs,
-          endMs: s.endMs,
-          speechMs: s.speechMs,
-        });
-      };
-      c.onSegmentError = (err) => {
-        // 段 WAV 落盘失败 = 内容已丢 → 显式终止(评审 ③)
-        statusBar.showError('Dictation failed');
-        void vscode.window.showErrorMessage(`VoiceFlow: failed to persist a segment — ${err.message}`);
-        inserter.flushFallback('segment-write-failed');
-        teardownSegmented('error');
-      };
-      c.onAutoStop = (reason) => {
-        log(`[recording] auto-stop: ${reason}`);
-        void stopSegmentedSession(reason);
-      };
-      c.onError = (err) => {
-        // device-lost 等:在途段全弃(S1 按段重申),已插入保留,累计 flush(v4-②)
-        log(`[recording] failed: ${err.code} — ${err.message}`);
-        inserter.flushFallback('device-lost');
-        statusBar.showError(`Recording failed: ${err.code}`);
-        teardownSegmented('error');
-        void showRecorderError(err);
-      };
-      return c;
-    };
-
     if (opts.systemAudio) {
-      // P2c:LoopbackRecorder(自研 addon + Silero VAD)。无 helper 回退——系统音频
-      // 没有备用采集路径,失败直接呈现(module-unavailable/init-failed 文案指引)
       const addonPath = vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-audio.node').fsPath;
       const modelPath = vscode.Uri.joinPath(
         extContext.extensionUri, 'media', 'vad', 'silero_vad_v5.onnx',
@@ -679,23 +709,29 @@ async function startSegmentedSession(
         loadVoiceflowAudio(addonPath),
         () => SileroVad.create(modelPath),
       );
-      const c = buildSegController(recorder);
-      await c.start();
+      const controller = buildSegController(recorder);
+      await controller.start();
       log('[dictation] recording via loopback (system audio)… (Ctrl+Alt+L to stop, Esc to cancel)');
-      seg.controller = c;
     } else {
-      seg.controller = await startWithRecorderFallback(cfg, buildSegController);
+      await startWithRecorderFallback(cfg, buildSegController);
     }
-    segmented = seg;
-    statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
-  } catch (err) {
-    pipeline.cancel();
-    seg.releaseLease?.();
-    session.dispatch('error');
-    statusBar.showError('Failed to start recording');
-    if (err instanceof RecorderError) void showRecorderError(err);
-    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
+    return seg;
+  } catch (error) {
+    disposeSegmentedResources(seg);
+    throw error;
   }
+}
+
+function disposeSegmentedResources(seg: SegmentedSession): void {
+  if (seg.disposed) return;
+  seg.disposed = true;
+  if (segmented === seg) segmented = undefined;
+  seg.pipeline.cancel();
+  seg.controller?.cancel();
+  seg.controller?.dispose();
+  seg.releaseLease?.();
+  disposeFocusedInputTracker();
+  statusBar.setSegmentActivity(0);
 }
 
 /** 正常停止(热键/自动停/backlog):封口尾段 → drain FIFO 全部段完成 → 终端确认/兜底 flush → idle。 */
@@ -729,13 +765,7 @@ async function stopSegmentedSession(reason: string): Promise<void> {
 function teardownSegmented(kind: 'error' | 'cancel'): void {
   const s = segmented;
   if (!s) return;
-  segmented = undefined;
-  s.pipeline.cancel();
-  s.controller?.cancel();
-  s.controller?.dispose();
-  s.releaseLease?.();
-  disposeFocusedInputTracker(); // chat-insert v6-B 挂点④(错误/Esc 路径 flushFallback 只剪贴板,不注入)
-  statusBar.setSegmentActivity(0);
+  disposeSegmentedResources(s);
   session.dispatch(kind);
 }
 
@@ -889,6 +919,10 @@ function cancelSession(): void {
   if (!session.active) return;
   if (session.state === 'preparing') {
     sessionPreflight.cancel();
+    if (segmented) {
+      segmented.inserter.flushFallback('esc-startup');
+      disposeSegmentedResources(segmented);
+    }
     preparedSession = undefined;
     log('[dictation] session preflight wait cancelled (Esc)');
     return;

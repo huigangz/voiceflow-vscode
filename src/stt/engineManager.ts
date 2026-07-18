@@ -130,7 +130,7 @@ export class EngineManager implements WhisperEngine {
   /** 解析最终 backend/model;auto 的不支持映射须先 prepare,给 blocked 回退一次发现机会。 */
   async resolveCapabilities(): Promise<EngineCapabilities> {
     let capabilities = this.capabilitiesFor(await this.resolveMode());
-    if (this.cfg.mode === 'auto' && !capabilities.canTranslateToEn) {
+    if (this.cfg.mode === 'auto' && capabilities.engine === 'server' && !capabilities.canTranslateToEn) {
       await this.prepare();
       capabilities = this.capabilitiesFor(await this.resolveMode());
     }
