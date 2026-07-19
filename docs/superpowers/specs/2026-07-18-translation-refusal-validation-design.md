@@ -46,3 +46,8 @@ Use TDD at the existing validation and pipeline seams:
 - A genuine refusal sentence in the transcript can still be translated.
 - No provider retry or additional token usage is introduced.
 - A rejected candidate inserts the original English injection-probe text in the editor, matching the parent plan's bounded source-fallback semantics.
+
+## Known Safe-Side Boundaries
+
+- An unenumerated source form such as `I'm sorry, but I can't help with that request` may leave the inserted apology phrase outside the matched span and fail `sourceRefusalDominates`. The result is a safe-side false rejection: the source text is inserted unchanged rather than translated. Keep the current narrow enumeration and extend it only if a later T3 provider run captures that form.
+- `outputIsMetaRefusal` searches, without anchoring, within the first 160 output characters. A normal translated conversation containing a matching request-refusal sentence in that window may therefore be rejected. This is an existing conservative tradeoff; the new request-directed branch does not change its scope. The failure remains bounded to source fallback.
