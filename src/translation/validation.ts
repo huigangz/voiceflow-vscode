@@ -1,6 +1,6 @@
 /** Explicit translation-task refusals only; ordinary apologies or inability statements are valid content. */
 export const TRANSLATION_META_REFUSAL_RE =
-  /(?:(?:无法|不能)(?:帮助|协助)?翻译(?:(?:您|你)?(?:所)?(?:提供的)?(?:内容|文本|请求)|此内容)|(?:无法|不能)处理(?:(?:您|你)?(?:所)?提供的(?:内容|文本)|(?:这个|该|此)(?:请求|内容))|I\s+(?:cannot|can't|am unable to)\s+(?:translate(?:\s+(?:the\s+)?provided\s+(?:content|text|request))?|provide\s+(?:(?:a|the)\s+translation|translated\s+(?:output|content|text))|process\s+(?:the\s+)?provided\s+(?:content|text|request)))/iu;
+  /(?:(?:无法|不能)(?:帮助|协助)?翻译(?:(?:您|你)?(?:所)?(?:提供的)?(?:内容|文本|请求)|此内容)|(?:无法|不能)处理(?:(?:您|你)?(?:所)?提供的(?:内容|文本)|(?:这个|该|此)(?:请求|内容))|(?:(?:抱歉|对不起)[,，]?\s*)?(?:我)?(?:无法|不能)(?:协助|帮助)(?:处理|完成)(?:这个|该|此|你的|您的)请求|(?:Sorry\s*,?\s*)?I\s+(?:cannot|can't|am unable to)\s+(?:assist|help)\s+with\s+(?:this|that|the|your)\s+request|I\s+(?:cannot|can't|am unable to)\s+(?:translate(?:\s+(?:the\s+)?provided\s+(?:content|text|request))?|provide\s+(?:(?:a|the)\s+translation|translated\s+(?:output|content|text))|process\s+(?:the\s+)?provided\s+(?:content|text|request)))/iu;
 
 const TASK_META_PREFIX_RE =
   /^(?:以下是(?:本次|该)?翻译结果|翻译如下|here is the translation)\s*[:：\-—]?/iu;
