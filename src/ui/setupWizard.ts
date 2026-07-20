@@ -103,7 +103,7 @@ export async function runSetupWizard(deps: WizardDeps): Promise<void> {
   }
 
   // ④ vscode.lm availability (F5.3)
-  const lm = await createVscodeLmProvider(log);
+  const lm = await createVscodeLmProvider(log, context.languageModelAccessInformation);
   const lmMsg = lm
     ? `AI cleanup available (${lm.name}) — will enhance automatically`
     : 'No AI model detected → using local rules cleanup (text stays on your machine). For AI cleanup, install Copilot or select claude-cli / codex-cli in settings';
@@ -140,7 +140,7 @@ async function runManagedSetup(deps: WizardDeps): Promise<void> {
   await cfg.update('inprocessModel', tier, vscode.ConfigurationTarget.Global);
   log(`[wizard] managed machine setup: whisper.mode=inprocess, model=${tier}`);
 
-  const lm = await createVscodeLmProvider(log);
+  const lm = await createVscodeLmProvider(log, context.languageModelAccessInformation);
   const lmMsg = lm
     ? `AI cleanup available (${lm.name}) — will enhance automatically`
     : 'No AI model detected → using local rules cleanup (text stays on your machine). For AI cleanup, install Copilot or select claude-cli / codex-cli in settings';

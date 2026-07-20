@@ -50,6 +50,10 @@
         "title": "VoiceFlow: Show Logs"
       },
       {
+        "command": "voiceflow.showTranslationUsage",
+        "title": "VoiceFlow: Show Translation Usage"
+      },
+      {
         "command": "voiceflow.dictateSystemAudio",
         "title": "VoiceFlow: Dictate from System Audio"
       }
@@ -114,6 +118,21 @@
           ],
           "default": "auto",
           "description": "Dictation language. auto = auto-detect (recommended; handles English, Chinese, and mixed correctly); zh = force Chinese; en = force English. Note: zh will translate pure-English speech into Chinese."
+        },
+        "voiceflow.translate.target": {
+          "type": "string",
+          "enum": [
+            "off",
+            "zh",
+            "en"
+          ],
+          "default": "off",
+          "description": "Translation target. off = normal dictation; en = fully local Whisper translation. zh is reserved for the LLM translation layer."
+        },
+        "voiceflow.translate.useLlm": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow translation to Chinese through the selected LLM provider. When enabled, transcript text is sent to an external model and leaves the local transcription pipeline."
         },
         "voiceflow.model": {
           "type": "string",

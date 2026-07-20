@@ -1,11 +1,28 @@
-import { describe, expect, it } from 'vitest';
-import { CleanupCancelled, EnhanceProvider, runCleanup } from '../src/cleanup/pipeline';
+import { describe, expect, it, vi } from 'vitest';
+import { CLEANUP_PROMPT, CleanupCancelled, runCleanup } from '../src/cleanup/pipeline';
+import { LlmProvider, ProviderResult } from '../src/cleanup/llmProvider';
 import { DEFAULT_RULES } from '../src/cleanup/rulesLayer';
 
 const base = { rules: DEFAULT_RULES, timeoutMs: 300 };
 
-function enhancer(fn: EnhanceProvider['cleanup'], name = 'fake-llm'): EnhanceProvider {
-  return { name, cleanup: fn };
+const usage = { inputTokens: 10, outputTokens: 3, estimate: false } as const;
+
+function provider(fn: LlmProvider['run'], name = 'fake-llm'): LlmProvider {
+  return { name, prepare: async () => ({ ok: true }), run: fn };
+}
+
+function enhancer(
+  fn: (text: string, signal: AbortSignal) => Promise<string>,
+  name = 'fake-llm',
+): LlmProvider {
+  return provider(
+    async (_instruction, text, signal) => ({
+      ok: true,
+      text: await fn(text, signal),
+      usage,
+    }),
+    name,
+  );
 }
 
 describe('清理管线 (F3.3/F3.4)', () => {
@@ -16,10 +33,15 @@ describe('清理管线 (F3.3/F3.4)', () => {
   });
 
   it('增强层正常返回 → 用增强结果,记录耗时', async () => {
+    let instruction = '';
     const r = await runCleanup('你好world', {
       ...base,
-      enhancer: enhancer(async (t) => `${t}(已润色)`),
+      enhancer: provider(async (receivedInstruction, text) => {
+        instruction = receivedInstruction;
+        return { ok: true, text: `${text}(已润色)`, usage };
+      }),
     });
+    expect(instruction).toBe(CLEANUP_PROMPT);
     expect(r.text).toBe('你好 world(已润色)');
     expect(r.usedProvider).toBe('fake-llm');
     expect(r.enhanceMs).toBeGreaterThanOrEqual(0);
@@ -30,20 +52,44 @@ describe('清理管线 (F3.3/F3.4)', () => {
     const r = await runCleanup('你好world', {
       ...base,
       timeoutMs: 50,
-      enhancer: enhancer(
-        (_t, signal) =>
-          new Promise((resolve, reject) => {
-            const timer = setTimeout(() => resolve('太慢了'), 5000);
-            signal.addEventListener('abort', () => {
-              clearTimeout(timer);
-              reject(new Error('aborted'));
-            });
+      enhancer: provider(
+        async (_instruction, _text, signal) =>
+          new Promise((resolve) => {
+            signal.addEventListener(
+              'abort',
+              () => resolve({ ok: false, kind: 'aborted', usage }),
+              { once: true },
+            );
           }),
       ),
     });
     expect(r.text).toBe('你好 world');
     expect(r.usedProvider).toBe('rules');
     expect(r.degraded).toBe('timeout');
+  });
+
+  it('hard timeout settles even when the provider ignores AbortSignal forever', async () => {
+    vi.useFakeTimers();
+    try {
+      let outcome: unknown;
+      void runCleanup('你好world', {
+        ...base,
+        timeoutMs: 50,
+        enhancer: provider(async () => new Promise<ProviderResult>(() => {})),
+      }).then((result) => {
+        outcome = result;
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(outcome).toMatchObject({
+        text: '你好 world',
+        usedProvider: 'rules',
+        degraded: 'timeout',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('增强层抛错 → 回落规则层结果', async () => {
@@ -55,6 +101,32 @@ describe('清理管线 (F3.3/F3.4)', () => {
     });
     expect(r.text).toBe('你好 world');
     expect(r.degraded).toBe('error');
+  });
+
+  it.each(['rate-limit', 'unavailable', 'error'] as const)(
+    'provider failure %s → 回落规则层结果',
+    async (kind) => {
+      const result = await runCleanup('你好world', {
+        ...base,
+        enhancer: provider(async (): Promise<ProviderResult> => ({
+          ok: false,
+          kind,
+          usage,
+          message: 'provider failed',
+        })),
+      });
+      expect(result.text).toBe('你好 world');
+      expect(result.degraded).toBe('error');
+    },
+  );
+
+  it('provider aborted without outer cancellation or timeout → error fallback', async () => {
+    const result = await runCleanup('你好world', {
+      ...base,
+      enhancer: provider(async () => ({ ok: false, kind: 'aborted', usage })),
+    });
+    expect(result.text).toBe('你好 world');
+    expect(result.degraded).toBe('error');
   });
 
   it('增强层返回空 → 回落规则层结果', async () => {
@@ -125,10 +197,14 @@ describe('清理管线 (F3.3/F3.4)', () => {
       {
         ...base,
         timeoutMs: 10_000,
-        enhancer: enhancer(
-          (_t, signal) =>
-            new Promise((_res, reject) =>
-              signal.addEventListener('abort', () => reject(new Error('aborted'))),
+        enhancer: provider(
+          async (_instruction, _text, signal) =>
+            new Promise((resolve) =>
+              signal.addEventListener(
+                'abort',
+                () => resolve({ ok: false, kind: 'aborted', usage }),
+                { once: true },
+              ),
             ),
         ),
       },
@@ -136,5 +212,22 @@ describe('清理管线 (F3.3/F3.4)', () => {
     );
     setTimeout(() => ac.abort(), 30);
     await expect(p).rejects.toBeInstanceOf(CleanupCancelled);
+  });
+
+  it('Esc settles promptly when the provider ignores AbortSignal forever', async () => {
+    const controller = new AbortController();
+    const pending = runCleanup(
+      '你好world',
+      {
+        ...base,
+        timeoutMs: 10_000,
+        enhancer: provider(async () => new Promise<ProviderResult>(() => {})),
+      },
+      controller.signal,
+    );
+
+    controller.abort();
+
+    await expect(pending).rejects.toBeInstanceOf(CleanupCancelled);
   });
 });

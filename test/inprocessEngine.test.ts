@@ -67,7 +67,7 @@ function makeWorld(): FakeWorld {
     },
     asr: undefined as never,
   };
-  const asr = (async (_audio: Float32Array, opts: { language: string; task: 'transcribe' }) => {
+  const asr = (async (_audio: Float32Array, opts: { language: string; task: 'transcribe' | 'translate' }) => {
     w.explicitCalls.push(opts);
     await takeGate();
     return { text: ` 显式${opts.language} ` };
@@ -151,6 +151,20 @@ describe('语言路径(s1-b 定案)', () => {
     expect(r.text).toBe('中文文本'); // 非 'TRANSLATED!'
     expect(r.detectedLanguage).toBe('zh'); // 归一词汇('zh',经 normalizeDetectedLanguage 锁定)
     await e.dispose();
+  });
+
+  it('translate 任务在显式语言与 auto 路径都强制 task=translate', async () => {
+    const explicit = makeWorld();
+    const explicitEngine = makeEngine(explicit);
+    await explicitEngine.transcribe('a.wav', { language: 'zh', task: 'translate', translationTarget: 'en' });
+    expect(explicit.explicitCalls).toEqual([{ language: 'zh', task: 'translate' }]);
+    await explicitEngine.dispose();
+
+    const auto = makeWorld();
+    const autoEngine = makeEngine(auto);
+    const result = await autoEngine.transcribe('a.wav', { task: 'translate', translationTarget: 'en' });
+    expect(result.text).toBe('TRANSLATED!');
+    await autoEngine.dispose();
   });
 });
 

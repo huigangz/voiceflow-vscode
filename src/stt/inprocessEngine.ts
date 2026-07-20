@@ -4,7 +4,7 @@
  * 语言方案(s1-b 定案,"原生 auto 单趟"):
  * - language=auto:generate 从裸 [<|startoftranscript|>] 起,模型自吐语言 token,
  *   从输出 ids 读回作 detectedLanguage(零额外 encoder 开销);
- *   **task 位强制 <|transcribe|>**(logits processor)——不强制则模型会在中英混样本上
+ *   **task 位按会话强制 transcribe/translate**(logits processor)——普通转写不强制则模型会在中英混样本上
  *   自选 <|translate|> 把中文译成英文(s1-b 实测地雷,0.2.0 language bug 的 task 版变体)
  * - language=zh/en:走 transformers.js 正常 language/task 参数路径
  *
@@ -30,7 +30,7 @@ import { configureInprocessEnv } from './onnxModels';
 
 /** transformers.js ASR pipeline 的最小结构面(懒加载 + 测试 fake)。 */
 export interface AsrPipelineLike {
-  (audio: Float32Array, opts: { language: string; task: 'transcribe' }): Promise<{ text: string }>;
+  (audio: Float32Array, opts: { language: string; task: 'transcribe' | 'translate' }): Promise<{ text: string }>;
   model: {
     generate(opts: Record<string, unknown>): Promise<{ data?: ArrayLike<number> } | ArrayLike<number>>;
     generation_config: { decoder_start_token_id: number; task_to_id: Record<string, number>; lang_to_id: Record<string, number> };
@@ -177,7 +177,7 @@ export class InprocessEngine implements WhisperEngine {
 
       const language = opts.language ?? this.cfg.language;
       const t0 = Date.now();
-      const run = this.runInference(asr, audio, language);
+      const run = this.runInference(asr, audio, language, opts.task ?? 'transcribe');
       const inflightRef = run.catch(() => {}); // 创建即挂 catch(v4-⑥,防 unhandledRejection)
       this.inflight = inflightRef;
       // 收尾钩子挂在 inflightRef(永不拒绝)上——挂在 run.finally 上会派生一条无人观察的拒绝链
@@ -201,24 +201,25 @@ export class InprocessEngine implements WhisperEngine {
     asr: AsrPipelineLike,
     audio: Float32Array,
     language: 'zh' | 'en' | 'auto',
+    task: 'transcribe' | 'translate',
   ): Promise<{ text: string; detectedLanguage?: string }> {
     try {
       if (language !== 'auto') {
-        const out = await asr(audio, { language, task: 'transcribe' });
+        const out = await asr(audio, { language, task });
         return { text: out.text.trim() };
       }
-      // 原生 auto 单趟(s1-b):裸 sot 起,读回语言 token;task 位强制 transcribe(防 translate 地雷)
+      // 原生 auto 单趟(s1-b):裸 sot 起,读回语言 token;task 位按会话强制(普通转写防 translate 地雷)
       const g = asr.model.generation_config;
-      const transcribeId = g.task_to_id['transcribe'];
-      const forceTranscribe = (
+      const taskId = g.task_to_id[task];
+      const forceTask = (
         input_ids: ArrayLike<number>[],
         logits: { data: Float32Array | number[] },
       ): unknown => {
         if (input_ids[0] !== undefined && (input_ids[0] as ArrayLike<number>).length === 2) {
           const d = logits.data as Float32Array;
-          const keep = d[transcribeId!]!;
+          const keep = d[taskId!]!;
           d.fill(-Infinity);
-          d[transcribeId!] = keep;
+          d[taskId!] = keep;
         }
         return logits;
       };
@@ -226,7 +227,7 @@ export class InprocessEngine implements WhisperEngine {
       const out = await asr.model.generate({
         ...feats,
         decoder_input_ids: [g.decoder_start_token_id],
-        logits_processor: [forceTranscribe],
+        logits_processor: [forceTask],
       });
       const raw = (out as { data?: ArrayLike<number> }).data ?? (out as ArrayLike<number>);
       const ids = Array.from(raw as ArrayLike<number>).map(Number);

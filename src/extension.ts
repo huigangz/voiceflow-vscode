@@ -3,7 +3,7 @@
  * Phase 0 — 已接入:S1 录音(Step 1)。待接入:whisper(Step 2)、插入(Step 3+)。
  */
 import * as vscode from 'vscode';
-import { Session } from './session';
+import { Session, toggleActionForSession } from './session';
 // WebviewRecorder 源码保留但运行时不可达(webview 无麦克风权限,microsoft/vscode#250568);
 // 不再 import,避免打包无用代码。
 import { HelperRecorder } from './audio/helperRecorder';
@@ -38,11 +38,42 @@ import { SegmentPipeline } from './segment/pipeline';
 import { validateSegmentedConfig } from './segment/config';
 import { RulesConfig, applyRules } from './cleanup/rulesLayer';
 import { isRealEditorDocScheme } from './insert/logic';
-import { CleanupCancelled, EnhanceProvider, runCleanup } from './cleanup/pipeline';
+import { CleanupCancelled, runCleanup } from './cleanup/pipeline';
+import { LlmProvider } from './cleanup/llmProvider';
 import { createVscodeLmProvider } from './cleanup/vscodeLmProvider';
-import { CliKind, createCliProvider } from './cleanup/cliProvider';
-import { StatusBar } from './ui/statusBar';
+import {
+  CliKind,
+  createCliExecutionContext,
+  createCliProvider,
+} from './cleanup/cliProvider';
+import { StatusBar, refreshTranslationTargetOnConfigurationChange } from './ui/statusBar';
 import { maybePromptSetup, runSetupWizard } from './ui/setupWizard';
+import {
+  MutableStartupResource,
+  SessionPreflight,
+  ShutdownResourceGate,
+  TranslationSessionSnapshot,
+  TranslationTarget,
+  TranslationUnsupportedError,
+  createTranslationSessionSnapshot,
+  languageHintForSession,
+  runCancellableStartup,
+  settleSessionShutdown,
+  startCancellableFallback,
+  transcribeOptionsForSession,
+  prepareTranslationSnapshot,
+} from './translation/sessionPreflight';
+import { runTranslate, TranslationResult } from './translation/pipeline';
+import { TranslationCoordinator } from './translation/coordinator';
+import { TranslationSessionFeedback } from './translation/feedback';
+import { TranslationSessionMetrics } from './translation/metrics';
+import { maybeShowTranslationPrivacyNotice } from './translation/privacyNotice';
+import {
+  TranslationSessionUsageAccounting,
+  TranslationUsageStore,
+  formatSessionUsage,
+  formatTranslationUsageReport,
+} from './translation/usage';
 
 let output: vscode.OutputChannel;
 let session: Session;
@@ -55,6 +86,21 @@ let insertTarget: InsertTarget = { kind: 'none' };
 let sttAbort: AbortController | undefined;
 let cleaningAbort: AbortController | undefined;
 let statusBar: StatusBar;
+let sessionPreflight: SessionPreflight;
+let translationUsageStore: TranslationUsageStore;
+type SessionUsageAccounting = TranslationSessionUsageAccounting;
+const sessionUsageAccountings = new Set<SessionUsageAccounting>();
+const activeBatchProcessing = new Set<Promise<void>>();
+const whisperGate = new ShutdownResourceGate<EngineManager>();
+let deactivating = false;
+interface PreparedSession {
+  snapshot: TranslationSessionSnapshot;
+  runner: EngineManager | undefined;
+  usage: SessionUsageAccounting;
+  feedback: TranslationSessionFeedback;
+  metrics: TranslationSessionMetrics;
+}
+let preparedSession: PreparedSession | undefined;
 /**
  * P2a 回退链(评审 ⑥/v7-②):addon 首次 start 失败且 code 为 module-unavailable /
  * blocked-by-policy → 当次回退 HelperRecorder,并在运行期记住(按 code,不靠 message)。
@@ -64,12 +110,16 @@ let addonFallbackCode: 'module-unavailable' | 'blocked-by-policy' | undefined;
 
 /** P2b:segmented 会话(与 batch 的 `recording` 互斥;同一时刻只有一种会话形态)。 */
 interface SegmentedSession {
-  controller: SegmentedRecordingController;
+  controller: SegmentedRecordingController | undefined;
+  controllerOwner: MutableStartupResource<SegmentedRecordingController>;
   pipeline: SegmentPipeline;
   inserter: SegmentInserter;
   releaseLease: (() => void) | undefined;
   pending: number;
   stopping: boolean;
+  prepared: PreparedSession;
+  metricsLogged: boolean;
+  disposed: boolean;
 }
 let segmented: SegmentedSession | undefined;
 
@@ -117,12 +167,37 @@ function log(line: string): void {
   output.appendLine(`${new Date().toISOString().slice(11, 23)} ${line}`);
 }
 
+function createSessionUsageAccounting(): SessionUsageAccounting {
+  const accounting = new TranslationSessionUsageAccounting(translationUsageStore, log);
+  sessionUsageAccountings.add(accounting);
+  return accounting;
+}
+
+function finalizeSessionUsage(accounting: SessionUsageAccounting): ReturnType<SessionUsageAccounting['snapshot']> {
+  const totals = accounting.finalize();
+  void accounting.settled().then(() => sessionUsageAccountings.delete(accounting));
+  return totals;
+}
+
+function showTranslationUsage(): void {
+  output.appendLine(formatTranslationUsageReport(translationUsageStore.snapshot()));
+  output.show();
+  void vscode.window.showInformationMessage('VoiceFlow: cumulative translation usage is shown in the VoiceFlow Output channel.');
+}
+
 export function activate(context: vscode.ExtensionContext): void {
+  deactivating = false;
+  whisperGate.reopen();
   extContext = context;
   output = vscode.window.createOutputChannel('VoiceFlow');
   session = new Session();
+  sessionPreflight = new SessionPreflight(session);
+  translationUsageStore = new TranslationUsageStore(context.globalState);
 
   statusBar = new StatusBar();
+  statusBar.setConfiguredTranslationTarget(
+    vscode.workspace.getConfiguration('voiceflow').get<TranslationTarget>('translate.target', 'off'),
+  );
 
   session.onTransition((state, prev) => {
     log(`[session] ${prev} -> ${state}`);
@@ -143,9 +218,19 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output,
     statusBar,
+    vscode.workspace.onDidChangeConfiguration((event) =>
+      refreshTranslationTargetOnConfigurationChange(
+        event,
+        () => vscode.workspace
+          .getConfiguration('voiceflow')
+          .get<TranslationTarget>('translate.target', 'off'),
+        (target) => statusBar.setConfiguredTranslationTarget(target),
+      ),
+    ),
     vscode.commands.registerCommand('voiceflow.toggleDictation', toggleDictation),
     vscode.commands.registerCommand('voiceflow.cancelSession', cancelSession),
     vscode.commands.registerCommand('voiceflow.showLogs', () => output.show()),
+    vscode.commands.registerCommand('voiceflow.showTranslationUsage', showTranslationUsage),
     vscode.commands.registerCommand('voiceflow.dictateSystemAudio', dictateSystemAudio),
     vscode.commands.registerCommand('voiceflow.downloadModel', () => modelManager.pickAndDownload()),
     vscode.commands.registerCommand('voiceflow.importModel', () => modelManager.pickAndImport()),
@@ -159,7 +244,7 @@ export function activate(context: vscode.ExtensionContext): void {
         recording?.dispose();
         if (segmented) {
           segmented.pipeline.cancel();
-          segmented.controller?.dispose();
+          segmented.controllerOwner.dispose();
           segmented.releaseLease?.();
           segmented = undefined;
         }
@@ -190,7 +275,16 @@ function whisperBinaryDir(cfg: vscode.WorkspaceConfiguration): string {
 }
 
 /** 懒构建/更新 EngineManager(inproc-s4;配置变更时热更新;模型换档触发引擎重载)。 */
-async function getWhisper(): Promise<EngineManager> {
+function getWhisper(): Promise<EngineManager> {
+  return whisperGate.run(resolveWhisper, async (runner) => {
+    // If deactivate already cleared this manager, its captured cleanup owns disposal.
+    if (whisper !== runner) return;
+    whisper = undefined;
+    await runner.dispose();
+  });
+}
+
+async function resolveWhisper(): Promise<EngineManager> {
   const cfg = vscode.workspace.getConfiguration('voiceflow');
   const tier = cfg.get<ModelTier>('model', 'small');
   const binaryDir = whisperBinaryDir(cfg);
@@ -220,8 +314,9 @@ async function getWhisper(): Promise<EngineManager> {
     log,
     onColdStart: (loading: boolean) => statusBar.setModelLoading(loading), // F2.1
   };
-  if (!whisper) {
-    whisper = new EngineManager(runnerCfg, {
+  let runner = whisper;
+  if (!runner) {
+    runner = new EngineManager(runnerCfg, {
       runner: new WhisperRunner(runnerCfg),
       createInprocess: (c) => new InprocessEngine(c),
       ensureInprocessModel: (t) => modelManager.ensureInprocessModel(t),
@@ -237,20 +332,28 @@ async function getWhisper(): Promise<EngineManager> {
         vscode.workspace.getConfiguration('voiceflow').get<InprocessTier>('inprocessModel', 'small-q8'),
       log,
     });
+    whisper = runner;
   } else {
-    await whisper.updateConfig(runnerCfg); // v7-②:等旧代际释放,防新旧引擎并存
+    await runner.updateConfig(runnerCfg); // v7-②:等旧代际释放,防新旧引擎并存
   }
-  return whisper;
+  return runner;
 }
 
 async function toggleDictation(args?: { focus?: FocusHint }): Promise<void> {
-  if (session.state === 'idle') {
-    await startRecording(args?.focus);
-  } else if (session.state === 'recording') {
-    if (segmented) await stopSegmentedSession('toggle');
-    else await stopRecordingAndProcess('toggle');
+  switch (toggleActionForSession(session.state, sessionPreflight.active)) {
+    case 'start':
+      await startRecording(args?.focus);
+      return;
+    case 'cancel-startup':
+      cancelStartingSession('toggle');
+      return;
+    case 'stop-recording':
+      if (segmented) await stopSegmentedSession('toggle');
+      else await stopRecordingAndProcess('toggle');
+      return;
+    case 'none':
+      return;
   }
-  // 其他阶段(含 draining):toggle 无效(取消走 Esc,spec §5.3)
 }
 
 /** P2a:按配置与运行期回退状态选录音后端。webview 路线已 No-Go(microsoft/vscode#250568),不在枚举内。 */
@@ -283,6 +386,8 @@ function buildController(recorder: Recorder, cfg: vscode.WorkspaceConfiguration)
     statusBar.showError(`Recording failed: ${err.code}`);
     recording?.dispose();
     recording = undefined;
+    if (preparedSession) finalizeSessionUsage(preparedSession.usage);
+    preparedSession = undefined;
     void showRecorderError(err);
   };
   return controller;
@@ -305,12 +410,40 @@ function notifyAddonFallback(code: 'module-unavailable' | 'blocked-by-policy'): 
 async function startWithRecorderFallback<T extends { start(): Promise<void>; dispose(): void }>(
   cfg: vscode.WorkspaceConfiguration,
   build: (recorder: Recorder) => T,
+  startup?: { signal: AbortSignal; owner: MutableStartupResource<T> },
 ): Promise<T> {
   const setting = cfg.get<'auto' | 'addon' | 'helper'>('recorder', 'auto');
   const kind: 'addon' | 'helper' =
     setting === 'helper' ? 'helper'
     : setting === 'addon' ? 'addon'
     : addonFallbackCode ? 'helper' : 'addon';
+  if (startup) {
+    let activeKind = kind;
+    const ctrl = await startCancellableFallback({
+      signal: startup.signal,
+      owner: startup.owner,
+      createPrimary: () => build(makeRecorder(kind)),
+      createFallback: () => build(makeRecorder('helper')),
+      shouldFallback: (err) =>
+        setting === 'auto' &&
+        kind === 'addon' &&
+        err instanceof RecorderError &&
+        (err.code === 'module-unavailable' || err.code === 'blocked-by-policy'),
+      onFallback: (err) => {
+        const code = (err as RecorderError).code as 'module-unavailable' | 'blocked-by-policy';
+        addonFallbackCode = code;
+        activeKind = 'helper';
+        log(`[recorder] addon start failed (${code}) — falling back to helper for this runtime`);
+        notifyAddonFallback(code);
+      },
+    });
+    log(
+      activeKind === 'helper' && kind === 'addon'
+        ? '[dictation] recording via helper (fallback)…'
+        : `[dictation] recording via ${activeKind}… (press Ctrl+Alt+L to stop, Esc to cancel)`,
+    );
+    return ctrl;
+  }
   let ctrl = build(makeRecorder(kind));
   try {
     await ctrl.start();
@@ -344,26 +477,113 @@ async function startRecording(focusHint: FocusHint): Promise<void> {
   return startBatchSession(cfg, focusHint);
 }
 
+function captureTranslationSnapshot(cfg: vscode.WorkspaceConfiguration): TranslationSessionSnapshot {
+  return createTranslationSessionSnapshot({
+    target: cfg.get<TranslationTarget>('translate.target', 'off'),
+    sourceHint: cfg.get<'zh' | 'en' | 'auto'>('language', 'auto'),
+    useLlm: cfg.get<boolean>('translate.useLlm', false),
+    provider: undefined,
+    timeoutMs: cfg.get<number>('cleanup.timeout', 8000),
+    rules: getRulesConfig(),
+  });
+}
+
+/** Resolve translation admission without ending the startup generation before recorder readiness. */
+async function admitBatchSession(
+  snapshot: TranslationSessionSnapshot,
+  providerPolicy: string,
+  usage: SessionUsageAccounting,
+  signal: AbortSignal,
+): Promise<PreparedSession> {
+  let resolvedRunner: EngineManager | undefined;
+  const preparedSnapshot = await prepareTranslationSnapshot(
+    snapshot,
+    async () => {
+      resolvedRunner = await getWhisper();
+      return resolvedRunner.resolveCapabilities();
+    },
+    () => pickEnhancer(providerPolicy),
+    signal,
+    (authorizationUsage) => usage.authorizationUsage(authorizationUsage),
+  );
+  if (preparedSnapshot.target === 'zh') {
+    maybeShowTranslationPrivacyNotice(
+      extContext.globalState,
+      (message) => vscode.window.showInformationMessage(message),
+    );
+  }
+  return {
+    snapshot: preparedSnapshot,
+    runner: resolvedRunner,
+    usage,
+    feedback: new TranslationSessionFeedback(),
+    metrics: new TranslationSessionMetrics(),
+  };
+}
+
 async function startBatchSession(
   cfg: vscode.WorkspaceConfiguration,
   focusHint: FocusHint,
 ): Promise<void> {
-  // F4:插入目标在录音开始时锁定
-  insertTarget = captureTarget(focusHint);
-  log(`[dictation] target locked: ${insertTarget.kind}`);
-  if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
-  session.dispatch('start');
+  const snapshot = captureTranslationSnapshot(cfg);
+  const providerPolicy = cfg.get<string>('cleanup.provider', 'auto');
+  const usage = createSessionUsageAccounting();
+  statusBar.setTranslationTarget(snapshot.target);
+  const controllerOwner = new MutableStartupResource<RecordingController>((controller) => {
+    controller.cancel();
+    controller.dispose();
+  });
   try {
-    recording = await startWithRecorderFallback(cfg, (r) => buildController(r, cfg));
+    const result = await runCancellableStartup(
+      sessionPreflight,
+      (signal) => admitBatchSession(snapshot, providerPolicy, usage, signal),
+      async (prepared, signal, frozenTarget) => {
+        // F4:插入目标在录音开始时锁定
+        insertTarget = frozenTarget;
+        log(`[dictation] target locked: ${insertTarget.kind}`);
+        if (insertTarget.kind === 'focused-input') armFocusedInputTracker(); // chat-insert v1
+        const controller = await startWithRecorderFallback(
+          cfg,
+          (recorder) => buildController(recorder, cfg),
+          { signal, owner: controllerOwner },
+        );
+        return { prepared, controller };
+      },
+      () => controllerOwner.dispose(),
+      {
+        commitImmediately: snapshot.target === 'off',
+        onCancel: () => {
+          controllerOwner.dispose();
+          disposeFocusedInputTracker();
+        },
+        captureBeforeAdmission: () => captureTarget(focusHint),
+      },
+    );
+    if (!result.started) {
+      finalizeSessionUsage(usage);
+      return;
+    }
+    preparedSession = result.value.prepared;
+    recording = result.value.controller;
     statusBar.recordingLive(); // 麦克风就绪才亮红点,防开头吞字
   } catch (err) {
     session.dispatch('error');
-    statusBar.showError('Failed to start recording');
-    recording?.dispose();
+    const preflightFailed = snapshot.target !== 'off' && controllerOwner.isDisposed === false;
+    statusBar.showError(preflightFailed ? 'Translation preflight failed' : 'Failed to start recording');
+    controllerOwner.dispose();
     recording = undefined;
+    finalizeSessionUsage(usage);
+    preparedSession = undefined;
     disposeFocusedInputTracker(); // v5-① 挂点①:启动失败不经处理流程 finally
-    if (err instanceof RecorderError) void showRecorderError(err);
-    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
+    if (err instanceof RecorderError) {
+      void showRecorderError(err);
+    } else {
+      const message = String(err);
+      if (preflightFailed) log(`[translation] preflight failed: ${message}`);
+      void vscode.window.showErrorMessage(
+        preflightFailed ? `VoiceFlow: ${message}` : `VoiceFlow: failed to start recording — ${message}`,
+      );
+    }
   }
 }
 
@@ -415,27 +635,90 @@ async function startSegmentedSession(
     void vscode.window.showErrorMessage(`VoiceFlow: ${valid.error}`);
     return;
   }
-  // ② 形态准入(评审 v8-⑤:CLI 显式拒绝不静默降级;v10-③/v11-⑤:快速判定不碰模型;
-  //    inproc-s4/§3.5:准入从"server"放宽为"server 或 inprocess"——两者常驻、无每段冷加载)
-  const binaryDir = whisperBinaryDir(cfg);
-  const engineMode = await resolveEngineMode({
-    mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
-    binaryDir,
-    serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
-    memory: blockedMemory(),
-  });
-  if (engineMode === 'cli') {
-    statusBar.showError('Segmented requires whisper server');
-    void vscode.window.showErrorMessage(
-      'VoiceFlow: segmented mode requires the whisper server binary (per-segment CLI cold-load latency is unacceptable). ' +
-        'Restore whisper-server.exe or set "voiceflow.output.mode" back to "batch".',
+  const snapshot = captureTranslationSnapshot(cfg);
+  const providerPolicy = cfg.get<string>('cleanup.provider', 'auto');
+  const usage = createSessionUsageAccounting();
+  statusBar.setTranslationTarget(snapshot.target);
+  let resolvedRunner: EngineManager | undefined;
+  try {
+    const result = await runCancellableStartup(
+      sessionPreflight,
+      async (signal) => {
+        const preparedSnapshot = await prepareTranslationSnapshot(
+          snapshot,
+          async () => {
+            resolvedRunner = await getWhisper();
+            return resolvedRunner.resolveCapabilities();
+          },
+          () => pickEnhancer(providerPolicy),
+          signal,
+          (authorizationUsage) => usage.authorizationUsage(authorizationUsage),
+        );
+        if (preparedSnapshot.target === 'zh') {
+          maybeShowTranslationPrivacyNotice(
+            extContext.globalState,
+            (message) => vscode.window.showInformationMessage(message),
+          );
+        }
+        if (signal.aborted) throw new Error('segmented admission cancelled');
+        // ② 形态准入属于同一可取消代际;off 虽已同步显示 recording,Esc 仍阻止晚到采集。
+        const binaryDir = whisperBinaryDir(cfg);
+        const engineMode = await resolveEngineMode({
+          mode: cfg.get<WhisperMode | 'auto' | 'inprocess'>('whisper.mode', 'auto'),
+          binaryDir,
+          serverBinStamp: (d = binaryDir) => serverBinaryStamp(d),
+          memory: blockedMemory(),
+        });
+        if (engineMode === 'cli') {
+          throw new TranslationUnsupportedError(
+            'Segmented mode requires the whisper server or in-process engine. Restore whisper-server.exe or use batch mode.',
+          );
+        }
+        return {
+          snapshot: preparedSnapshot,
+          runner: resolvedRunner,
+          usage,
+          feedback: new TranslationSessionFeedback(),
+          metrics: new TranslationSessionMetrics(),
+        };
+      },
+      (prepared, signal) => startSegmentedCapture(
+        cfg,
+        focusHint,
+        opts,
+        prepared,
+        valid.segmentPauseMs,
+        autoStopSilenceS,
+        signal,
+      ),
+      disposeSegmentedResources,
+      { commitImmediately: snapshot.target === 'off' },
     );
-    return;
+    if (!result.started) {
+      finalizeSessionUsage(usage);
+      return;
+    }
+    statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
+  } catch (err) {
+    finalizeSessionUsage(usage);
+    statusBar.showError('Failed to start recording');
+    if (err instanceof RecorderError) void showRecorderError(err);
+    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
   }
+}
 
+async function startSegmentedCapture(
+  cfg: vscode.WorkspaceConfiguration,
+  focusHint: FocusHint,
+  opts: { systemAudio?: boolean },
+  prepared: PreparedSession,
+  segmentPauseMs: number,
+  autoStopSilenceS: number,
+  signal: AbortSignal,
+): Promise<SegmentedSession> {
+  if (signal.aborted) throw new Error('segmented startup cancelled before capture');
   insertTarget = captureTarget(focusHint);
   log(`[dictation] target locked: ${insertTarget.kind} (segmented)`);
-  // chat-insert v6-B:focused-input 逐段累计(同 none),正常结束单次注入(dispatch 全套判定)
   if (insertTarget.kind === 'focused-input') armFocusedInputTracker();
   const inserter = new SegmentInserter(insertTarget, log, async (text) => {
     const fiOpts = focusedInputOpts();
@@ -446,9 +729,12 @@ async function startSegmentedSession(
     await dispatchInsert({ kind: 'focused-input' }, text, fiOpts);
   });
 
-  // ③ 并行预热(评审 v6-⑥):会话 lease 先行(v11-②);prepare 失败不阻会话,首段会再试
+  // Preserve off-mode parallel warmup. If it resolves after cancellation, release its lease immediately.
   const warmup = (async () => {
-    const runner = await getWhisper(); // 含模型确保(首次可能下载)
+    const runner = prepared.runner ?? await getWhisper();
+    if (deactivating || signal.aborted) {
+      throw new WhisperError('cancelled', 'segmented warmup cancelled');
+    }
     const release = runner.acquireLease();
     runner.prepare().catch((e: unknown) =>
       log(`[whisper] warmup failed (first segment will retry): ${String((e as Error)?.message ?? e)}`),
@@ -456,51 +742,110 @@ async function startSegmentedSession(
     return { runner, release };
   })();
 
+  const controllerOwner = new MutableStartupResource<SegmentedRecordingController>((controller) => {
+    controller.cancel();
+    controller.dispose();
+  });
   const seg: SegmentedSession = {
-    controller: undefined as unknown as SegmentedRecordingController,
+    controller: undefined,
+    controllerOwner,
     pipeline: undefined as unknown as SegmentPipeline,
     inserter,
     releaseLease: undefined,
     pending: 0,
     stopping: false,
+    prepared,
+    metricsLogged: false,
+    disposed: false,
   };
   warmup.then(
-    ({ release }) => { seg.releaseLease = release; },
-    () => { /* 预热失败:首段 transcribe 走同一失败路径(fatal 显式终止) */ },
+    ({ release }) => {
+      if (signal.aborted || segmented !== seg || seg.disposed) release();
+      else seg.releaseLease = release;
+    },
+    () => { /* 首段 transcribe 走同一失败路径 */ },
   );
 
-  const rulesCfg = getRulesConfig();
-  // 会话语言锁定(评审 ⑤ + v9-⑦):仅 language=auto 参与;首个语音 ≥2s 的段锁定(过短首段不锁);
-  // detected_language 拿不到(如 CLI)则维持逐段 auto。锁定状态由管线闭包持有,不污染 cfg。
-  const baseLanguage = cfg.get<'zh' | 'en' | 'auto'>('language', 'auto');
+  const rulesCfg = prepared.snapshot.rules as RulesConfig;
+  if (prepared.snapshot.target === 'zh' && prepared.snapshot.provider === undefined) {
+    throw new TranslationUnsupportedError('The frozen LLM translation provider is unavailable.');
+  }
+  const coordinator = prepared.snapshot.target === 'zh'
+    ? new TranslationCoordinator(
+        (source, detectedLanguage, segmentSignal) => runTranslate(
+          source,
+          detectedLanguage,
+          {
+            rules: rulesCfg,
+            timeoutMs: prepared.snapshot.timeoutMs,
+            provider: prepared.snapshot.provider!,
+            log,
+            onRequestStart: () => prepared.usage.translationStarted(),
+            onUsage: (usage) => prepared.usage.translationUsage(usage),
+            onSettled: () => prepared.usage.translationSettled(),
+          },
+          segmentSignal,
+        ),
+        (source) => applyRules(source, rulesCfg),
+      )
+    : undefined;
+  const notifyTranslationResult = (result: TranslationResult, segmentIndex?: number): void => {
+    const fallback = ['timeout', 'error', 'empty', 'rejected', 'circuit-open'].includes(result.outcome);
+    log(`[translation]${segmentIndex === undefined ? '' : ` segment #${segmentIndex}`} ${result.outcome}` +
+      (fallback ? ' — inserted original' : ''));
+    const notice = prepared.feedback.notificationFor(result);
+    if (notice !== undefined) void vscode.window.showWarningMessage(notice);
+    if (coordinator?.isOpen && result.outcome !== 'circuit-open') {
+      const circuitNotice = prepared.feedback.notificationFor({ text: result.text, outcome: 'circuit-open' });
+      if (circuitNotice !== undefined) void vscode.window.showWarningMessage(circuitNotice);
+    }
+  };
+  const baseLanguage = prepared.snapshot.sourceHint;
   let lockedLanguage: 'zh' | 'en' | undefined;
   let firstSegmentDone = false;
   const MIN_LOCK_SPEECH_MS = 2000;
   const pipeline = new SegmentPipeline({
-    transcribe: async (wav, signal, s) => {
+    transcribe: async (wav, segmentSignal, s) => {
       const { runner } = await warmup;
-      const r = await runner.transcribe(wav, { signal, language: lockedLanguage });
-      // 首段 cold latency 单列(评审 v6-⑥,不计入 P50/P95)
+      const decodeLanguageHint = languageHintForSession(prepared.snapshot, lockedLanguage);
+      const r = await runner.transcribe(wav, {
+        ...transcribeOptionsForSession(prepared.snapshot),
+        signal: segmentSignal,
+        language: decodeLanguageHint,
+      });
       log(
         `[metrics] segment #${s.index}${firstSegmentDone ? '' : ' (first)'} ` +
           `cold=${r.coldStartMs ?? 0}ms warm=${r.transcribeMs}ms ` +
           `lang=${lockedLanguage ?? baseLanguage}${r.detectedLanguage ? ` detected=${r.detectedLanguage}` : ''}`,
       );
       firstSegmentDone = true;
-      if (baseLanguage === 'auto' && lockedLanguage === undefined && s.speechMs >= MIN_LOCK_SPEECH_MS) {
-        // v4-⑦ 唯一映射点:server('chinese'/'english')与 inprocess('zh'/'en')双词汇归一
+      if (
+        prepared.snapshot.target === 'off' &&
+        baseLanguage === 'auto' &&
+        lockedLanguage === undefined &&
+        s.speechMs >= MIN_LOCK_SPEECH_MS
+      ) {
         const mapped = normalizeDetectedLanguage(r.detectedLanguage);
         if (mapped) {
           lockedLanguage = mapped;
           log(`[dictation] session language locked: ${mapped} (segment #${s.index}, speech ${(s.speechMs / 1000).toFixed(1)}s)`);
         }
       }
-      return r.text;
+      return {
+        text: r.text,
+        detectedLanguage: normalizeDetectedLanguage(r.detectedLanguage),
+        decodeLanguageHint,
+      };
     },
-    cleanup: (raw) => applyRules(raw, rulesCfg), // v1:分段只做规则清理(D2 定 LLM 是否按段开)
-    insert: async (text) => inserter.insertSegment(text),
+    cleanup: async (raw, detectedLanguage, segmentSignal) => coordinator === undefined
+      ? { text: applyRules(raw, rulesCfg), outcome: 'rules-only' }
+      : coordinator.run(raw, detectedLanguage, segmentSignal),
+    insert: async (text, _segment, onVisible) => inserter.insertSegment(
+      text,
+      prepared.snapshot.target === 'zh' ? onVisible : undefined,
+    ),
     deleteWav: async (p) => {
-      seg.pending = Math.max(0, seg.pending - 1); // 每段恰好删一次(成败同待遇)→ 计数在此收敛
+      seg.pending = Math.max(0, seg.pending - 1);
       statusBar.setSegmentActivity(seg.pending);
       try {
         await vscode.workspace.fs.delete(vscode.Uri.file(p));
@@ -508,14 +853,27 @@ async function startSegmentedSession(
     },
     log,
     onFatal: (err) => {
-      // 显式终止(评审 ③):停录 + 状态栏错误 + flush 兜底,绝不静默缺句
       statusBar.showError('Dictation failed');
       void vscode.window.showErrorMessage(`VoiceFlow: ${err.message}`);
-      inserter.flushFallback('fatal'); // 错误路径销毁管线前先 flush(v4-②)
+      inserter.flushFallback('fatal');
       teardownSegmented('error');
     },
+    onResult: (result, segment, _processingMs) => {
+      if (prepared.snapshot.target !== 'zh') return;
+      notifyTranslationResult(result, segment.index);
+    },
+    onVisibleResult: (result, _segment, processingMs) => {
+      if (prepared.snapshot.target !== 'zh') return;
+      prepared.metrics.observe(result.outcome, processingMs);
+    },
+    onBacklogPressure: (queuedMs) => {
+      if (coordinator === undefined) return;
+      coordinator.openForBacklog(queuedMs);
+      const notice = prepared.feedback.notificationFor({ text: '', outcome: 'circuit-open' });
+      if (notice !== undefined) void vscode.window.showWarningMessage(notice);
+      log(`[translation] circuit opened by backlog pressure (${queuedMs}ms queued)`);
+    },
     onBacklogLimit: () => {
-      // v12-②:停采集,已入队段照常 drain 全部出字
       void vscode.window.showWarningMessage(
         'VoiceFlow: transcription is falling behind — recording stopped early. Queued segments will still be inserted.',
       );
@@ -523,65 +881,55 @@ async function startSegmentedSession(
     },
   });
   seg.pipeline = pipeline;
+  // Ownership is visible before recorder.start():Esc can now cancel/dispose an in-progress startup.
+  segmented = seg;
 
-  // D6:系统音频独立会话上限(默认 30min;分段管线段完即插即删,长会话内存平稳)
   const maxDurationMs =
     (opts.systemAudio
       ? cfg.get<number>('systemAudio.maxDuration', 1800)
       : cfg.get<number>('recording.maxDuration', 120)) * 1000;
-
-  session.dispatch('start');
-  try {
-    const buildSegController = (r: Recorder): SegmentedRecordingController => {
-      const c = new SegmentedRecordingController(
-        r,
-        {
-          maxDurationMs,
-          autoStopSilenceMs: autoStopSilenceS * 1000,
-        },
-        valid.segmentPauseMs,
-        extContext.globalStorageUri,
-        log,
-        // 强制切分 20s(P2c gate 实测:连续解说无停顿 → 段膨胀触发 backlog 停采;
-        // 对口述同样防长独白撑爆;whisper 30s 窗内,20s 段 warm ~6s 管线稳跟)
-        { maxSegmentMs: 20_000 },
-      );
-      c.onSegment = (s) => {
-        seg.pending++;
-        statusBar.setSegmentActivity(seg.pending);
-        pipeline.enqueue({
-          wavPath: s.wavUri.fsPath,
-          index: s.index,
-          startMs: s.startMs,
-          endMs: s.endMs,
-          speechMs: s.speechMs,
-        });
-      };
-      c.onSegmentError = (err) => {
-        // 段 WAV 落盘失败 = 内容已丢 → 显式终止(评审 ③)
-        statusBar.showError('Dictation failed');
-        void vscode.window.showErrorMessage(`VoiceFlow: failed to persist a segment — ${err.message}`);
-        inserter.flushFallback('segment-write-failed');
-        teardownSegmented('error');
-      };
-      c.onAutoStop = (reason) => {
-        log(`[recording] auto-stop: ${reason}`);
-        void stopSegmentedSession(reason);
-      };
-      c.onError = (err) => {
-        // device-lost 等:在途段全弃(S1 按段重申),已插入保留,累计 flush(v4-②)
-        log(`[recording] failed: ${err.code} — ${err.message}`);
-        inserter.flushFallback('device-lost');
-        statusBar.showError(`Recording failed: ${err.code}`);
-        teardownSegmented('error');
-        void showRecorderError(err);
-      };
-      return c;
+  const buildSegController = (r: Recorder): SegmentedRecordingController => {
+    const c = new SegmentedRecordingController(
+      r,
+      { maxDurationMs, autoStopSilenceMs: autoStopSilenceS * 1000 },
+      segmentPauseMs,
+      extContext.globalStorageUri,
+      log,
+      { maxSegmentMs: 20_000 },
+    );
+    c.onSegment = (s) => {
+      seg.pending++;
+      statusBar.setSegmentActivity(seg.pending);
+      pipeline.enqueue({
+        wavPath: s.wavUri.fsPath,
+        index: s.index,
+        startMs: s.startMs,
+        endMs: s.endMs,
+        speechMs: s.speechMs,
+      });
     };
+    c.onSegmentError = (err) => {
+      statusBar.showError('Dictation failed');
+      void vscode.window.showErrorMessage(`VoiceFlow: failed to persist a segment — ${err.message}`);
+      inserter.flushFallback('segment-write-failed');
+      teardownSegmented('error');
+    };
+    c.onAutoStop = (reason) => {
+      log(`[recording] auto-stop: ${reason}`);
+      void stopSegmentedSession(reason);
+    };
+    c.onError = (err) => {
+      log(`[recording] failed: ${err.code} — ${err.message}`);
+      inserter.flushFallback('device-lost');
+      statusBar.showError(`Recording failed: ${err.code}`);
+      teardownSegmented('error');
+      void showRecorderError(err);
+    };
+    return c;
+  };
 
+  try {
     if (opts.systemAudio) {
-      // P2c:LoopbackRecorder(自研 addon + Silero VAD)。无 helper 回退——系统音频
-      // 没有备用采集路径,失败直接呈现(module-unavailable/init-failed 文案指引)
       const addonPath = vscode.Uri.joinPath(extContext.extensionUri, 'bin', 'voiceflow-audio.node').fsPath;
       const modelPath = vscode.Uri.joinPath(
         extContext.extensionUri, 'media', 'vad', 'silero_vad_v5.onnx',
@@ -591,46 +939,71 @@ async function startSegmentedSession(
         loadVoiceflowAudio(addonPath),
         () => SileroVad.create(modelPath),
       );
-      const c = buildSegController(recorder);
-      await c.start();
+      const controller = buildSegController(recorder);
+      if (!controllerOwner.replace(controller)) throw new Error('segmented startup cancelled');
+      await controller.start();
+      if (signal.aborted) throw new Error('segmented startup cancelled');
+      seg.controller = controller;
       log('[dictation] recording via loopback (system audio)… (Ctrl+Alt+L to stop, Esc to cancel)');
-      seg.controller = c;
     } else {
-      seg.controller = await startWithRecorderFallback(cfg, buildSegController);
+      seg.controller = await startWithRecorderFallback(
+        cfg,
+        buildSegController,
+        { signal, owner: controllerOwner },
+      );
     }
-    segmented = seg;
-    statusBar.recordingLive(opts.systemAudio ? 'system' : 'mic');
-  } catch (err) {
-    pipeline.cancel();
-    seg.releaseLease?.();
-    session.dispatch('error');
-    statusBar.showError('Failed to start recording');
-    if (err instanceof RecorderError) void showRecorderError(err);
-    else void vscode.window.showErrorMessage(`VoiceFlow: failed to start recording — ${String(err)}`);
+    return seg;
+  } catch (error) {
+    disposeSegmentedResources(seg);
+    throw error;
   }
+}
+
+function logSegmentedTranslationMetrics(seg: SegmentedSession): void {
+  if (seg.metricsLogged) return;
+  seg.metricsLogged = true;
+  const totals = finalizeSessionUsage(seg.prepared.usage);
+  if (seg.prepared.snapshot.target !== 'zh') return;
+  log(formatSessionUsage(totals));
+  log(`[metrics] translate-session: ${JSON.stringify(seg.prepared.metrics.summary())}`);
+}
+
+function disposeSegmentedResources(seg: SegmentedSession): void {
+  if (seg.disposed) return;
+  seg.disposed = true;
+  logSegmentedTranslationMetrics(seg);
+  if (segmented === seg) segmented = undefined;
+  seg.pipeline.cancel();
+  seg.controllerOwner.dispose();
+  seg.releaseLease?.();
+  disposeFocusedInputTracker();
+  statusBar.setSegmentActivity(0);
 }
 
 /** 正常停止(热键/自动停/backlog):封口尾段 → drain FIFO 全部段完成 → 终端确认/兜底 flush → idle。 */
 async function stopSegmentedSession(reason: string): Promise<void> {
   const s = segmented;
-  if (!s || s.stopping || session.state !== 'recording') return;
+  if (!s || !s.controller || s.stopping || session.state !== 'recording') return;
+  const controller = s.controller;
   s.stopping = true;
   log(`[dictation] segmented stop(${reason})`);
   session.dispatch('drainStart');
   try {
-    const { durationMs } = await s.controller.finish(); // 冲刷尾帧 + 封口尾段 + 段 WAV 全落盘
+    const { durationMs } = await controller.finish(); // 冲刷尾帧 + 封口尾段 + 段 WAV 全落盘
     log(`[dictation] recording ended (${durationMs}ms), draining ${s.pending} pending segment(s)…`);
     await s.pipeline.drained();
     if (segmented !== s) return; // drain 期间 fatal/Esc 已 teardown
     await s.inserter.finishSession(); // 终端 Send/Copy 确认(v7-⑤)/ focused-input 单次注入(v6-B)/ 累计入剪贴板
     segmented = undefined;
-    s.controller.dispose();
+    s.controllerOwner.dispose();
     s.releaseLease?.();
     disposeFocusedInputTracker(); // v6-B:segmented 正常结束收口(注入判定已在 finishSession 内取过快照)
     statusBar.setSegmentActivity(0);
     session.dispatch('drained');
     log(`[metrics] segmented session done: inserted=${s.inserter.stats.inserted}`);
+    logSegmentedTranslationMetrics(s);
   } catch (err) {
+    if (deactivating) return;
     log(`[dictation] segmented stop failed: ${String(err)}`);
     s.inserter.flushFallback('stop-error');
     teardownSegmented('error');
@@ -641,22 +1014,31 @@ async function stopSegmentedSession(reason: string): Promise<void> {
 function teardownSegmented(kind: 'error' | 'cancel'): void {
   const s = segmented;
   if (!s) return;
-  segmented = undefined;
-  s.pipeline.cancel();
-  s.controller?.cancel();
-  s.controller?.dispose();
-  s.releaseLease?.();
-  disposeFocusedInputTracker(); // chat-insert v6-B 挂点④(错误/Esc 路径 flushFallback 只剪贴板,不注入)
-  statusBar.setSegmentActivity(0);
+  disposeSegmentedResources(s);
   session.dispatch(kind);
 }
 
-async function stopRecordingAndProcess(reason: string): Promise<void> {
-  if (!recording || session.state !== 'recording') return;
+function stopRecordingAndProcess(reason: string): Promise<void> {
+  if (!recording || session.state !== 'recording') return Promise.resolve();
+  const processing = processRecordingAndInsert(reason, recording);
+  activeBatchProcessing.add(processing);
+  void processing.then(
+    () => activeBatchProcessing.delete(processing),
+    () => activeBatchProcessing.delete(processing),
+  );
+  return processing;
+}
+
+async function processRecordingAndInsert(
+  reason: string,
+  activeRecording: RecordingController,
+): Promise<void> {
+  const processingSession = preparedSession;
   session.dispatch('stopRecording');
   let wavUri: vscode.Uri | undefined;
+  let finishTranslationObservation: (() => void) | undefined;
   try {
-    const result = await recording.finish();
+    const result = await activeRecording.finish();
     wavUri = result.wavUri;
     log(`[dictation] stop(${reason}): ${result.durationMs}ms, mode=${result.mode}`);
     if (!result.hasSpeech) {
@@ -665,11 +1047,22 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       session.dispatch('cancel');
       return;
     }
+    if (deactivating || (session.state as string) !== 'transcribing') return;
 
     // Step 2:whisper 转写(埋点:cold start 与 warm 分开,§8.1)
-    const runner = await getWhisper();
+    const translationStartedAt = Date.now();
+    const activeTranslation = processingSession;
+    const snapshot = activeTranslation?.snapshot ?? captureTranslationSnapshot(vscode.workspace.getConfiguration('voiceflow'));
+    const runner = activeTranslation?.runner ?? await getWhisper();
+    if (deactivating) return;
     sttAbort = new AbortController();
-    const stt = await runner.transcribe(result.wavUri.fsPath, { signal: sttAbort.signal });
+    const stt = await runner.transcribe(result.wavUri.fsPath, {
+      ...transcribeOptionsForSession(snapshot),
+      signal: sttAbort.signal,
+      language: snapshot.target === 'off'
+        ? undefined
+        : snapshot.target === 'zh' ? 'auto' : snapshot.sourceHint,
+    });
     sttAbort = undefined;
     if ((session.state as string) !== 'transcribing') return; // Esc 已取消
     log(
@@ -681,26 +1074,62 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     const vfCfg = vscode.workspace.getConfiguration('voiceflow');
     cleaningAbort = new AbortController();
     const tClean = Date.now();
-    const cleanResult = await runCleanup(
-      stt.text,
-      {
-        rules: getRulesConfig(),
-        timeoutMs: vfCfg.get<number>('cleanup.timeout', 8000),
-        enhancer: await pickEnhancer(vfCfg.get<string>('cleanup.provider', 'auto')),
-        log,
-      },
-      cleaningAbort.signal,
-    );
+    let cleaned: string;
+    if (snapshot.target === 'zh') {
+      if (!activeTranslation || snapshot.provider === undefined) {
+        throw new TranslationUnsupportedError('The frozen LLM translation provider is unavailable.');
+      }
+      const translated = await runTranslate(
+        stt.text,
+        normalizeDetectedLanguage(stt.detectedLanguage),
+        {
+          rules: snapshot.rules as RulesConfig,
+          timeoutMs: snapshot.timeoutMs,
+          provider: snapshot.provider,
+          log,
+          onRequestStart: () => activeTranslation.usage.translationStarted(),
+          onUsage: (usage) => activeTranslation.usage.translationUsage(usage),
+          onSettled: () => activeTranslation.usage.translationSettled(),
+        },
+        cleaningAbort.signal,
+      );
+      cleaned = translated.text;
+      finishTranslationObservation = activeTranslation.metrics.deferVisibleObservation(
+        translated.outcome,
+        translationStartedAt,
+      );
+      const notice = activeTranslation.feedback.notificationFor(translated);
+      if (notice !== undefined) void vscode.window.showWarningMessage(notice);
+      log(`[translation] batch ${translated.outcome}` +
+        (['timeout', 'error', 'empty', 'rejected'].includes(translated.outcome)
+          ? ' — inserted original'
+          : ''));
+      log(`[metrics] translate=${Date.now() - tClean}ms`);
+    } else {
+      const cleanResult = await runCleanup(
+        stt.text,
+        {
+          rules: snapshot.target === 'off' ? getRulesConfig() : snapshot.rules as RulesConfig,
+          timeoutMs: snapshot.target === 'off' ? vfCfg.get<number>('cleanup.timeout', 8000) : snapshot.timeoutMs,
+          enhancer: snapshot.target === 'off'
+            ? await pickEnhancer(vfCfg.get<string>('cleanup.provider', 'auto'))
+            : undefined,
+          log,
+        },
+        cleaningAbort.signal,
+      );
+      cleaned = cleanResult.text;
+      log(
+        `[metrics] cleanup=${Date.now() - tClean}ms provider=${cleanResult.usedProvider}` +
+          (cleanResult.degraded !== undefined ? ` degraded=${cleanResult.degraded}` : ''),
+      );
+    }
     cleaningAbort = undefined;
-    const cleaned = cleanResult.text;
-    log(
-      `[metrics] cleanup=${Date.now() - tClean}ms provider=${cleanResult.usedProvider}` +
-        (cleanResult.degraded !== undefined ? ` degraded=${cleanResult.degraded}` : ''),
-    );
     if ((session.state as string) !== 'cleaning') return; // Esc 已取消
     session.dispatch('cleaned');
 
     if (cleaned.length === 0) {
+      finishTranslationObservation?.();
       log('[dictation] empty transcription, nothing to insert');
       session.dispatch('cancel');
       return;
@@ -723,6 +1152,7 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       }
       if (choice === 'Copy to clipboard') {
         await vscode.env.clipboard.writeText(cleaned);
+        finishTranslationObservation?.();
         vscode.window.setStatusBarMessage('$(clippy) VoiceFlow: Copied to clipboard', 5000);
         session.dispatch('cancel');
         return;
@@ -740,9 +1170,11 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
       );
     }
     const outcome = await dispatchInsert(insertTarget, cleaned, fiOpts);
+    finishTranslationObservation?.();
     session.dispatch('inserted');
     log(`[metrics] insert=${Date.now() - t0}ms outcome=${outcome}`);
   } catch (err) {
+    if (deactivating) return;
     if (err instanceof CleanupCancelled || (err instanceof WhisperError && err.kind === 'cancelled')) {
       log('[dictation] cancelled by user');
       return; // 会话已由 cancelSession 置回 idle
@@ -752,8 +1184,16 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
     log(`[dictation] failed: ${String(err)}`);
     void vscode.window.showErrorMessage(`VoiceFlow: ${String(err)}`);
   } finally {
+    if (processingSession) {
+      const totals = finalizeSessionUsage(processingSession.usage);
+      if (!deactivating && processingSession.snapshot.target === 'zh') {
+        log(formatSessionUsage(totals));
+        log(`[metrics] translate-session: ${JSON.stringify(processingSession.metrics.summary())}`);
+      }
+    }
     recording?.dispose();
     recording = undefined;
+    preparedSession = undefined;
     disposeFocusedInputTracker(); // v5-① 挂点③:转写失败/空文本/Copy/Discard/正常完成全收口
     // 临时 WAV 用完即删(隐私:音频不留盘)
     if (wavUri) {
@@ -765,13 +1205,16 @@ async function stopRecordingAndProcess(reason: string): Promise<void> {
 }
 
 /** D9/F3.3 provider 逻辑:auto=rules+vscode.lm(可用则用);CLI 仅显式选择。 */
-async function pickEnhancer(provider: string): Promise<EnhanceProvider | undefined> {
+async function pickEnhancer(provider: string): Promise<LlmProvider | undefined> {
   switch (provider) {
     case 'auto':
-      return createVscodeLmProvider(log); // 无模型 → undefined = rules-only
+      return createVscodeLmProvider(log, extContext.languageModelAccessInformation); // 无模型 → undefined = rules-only
     case 'claude-cli':
     case 'codex-cli':
-      return createCliProvider(provider as CliKind);
+      return createCliProvider(
+        provider as CliKind,
+        createCliExecutionContext(extContext.globalStorageUri.fsPath),
+      );
     default: // 'rules-only'
       return undefined;
   }
@@ -788,8 +1231,21 @@ function getRulesConfig(): RulesConfig {
   };
 }
 
+function cancelStartingSession(trigger: 'Esc' | 'toggle'): boolean {
+  if (!sessionPreflight.cancel()) return false;
+  if (segmented) {
+    segmented.inserter.flushFallback(trigger === 'Esc' ? 'esc-startup' : 'toggle-startup');
+    disposeSegmentedResources(segmented);
+  }
+  preparedSession = undefined;
+  disposeFocusedInputTracker();
+  log(`[dictation] session startup cancelled (${trigger})`);
+  return true;
+}
+
 function cancelSession(): void {
   if (!session.active) return;
+  if (cancelStartingSession('Esc')) return;
   if (segmented) {
     // 分段 Esc 语义(spec §5.3 修订):停录 + abort 在途 + 删未提交段文件,已插入的段不回收;
     // 已完成未插入的累计文本先 flush(v4-② Esc 路径)
@@ -801,6 +1257,8 @@ function cancelSession(): void {
   recording?.cancel();
   recording?.dispose();
   recording = undefined;
+  if (preparedSession) finalizeSessionUsage(preparedSession.usage);
+  preparedSession = undefined;
   disposeFocusedInputTracker(); // v5-① 挂点②:录音期 Esc 不经处理流程 finally
   sttAbort?.abort(); // 中止进行中的转写(CLI kill / HTTP abort;server 进程保留,v10-① 双信号)
   sttAbort = undefined;
@@ -831,18 +1289,39 @@ async function showRecorderError(err: RecorderError): Promise<void> {
   else if (action === 'View Logs') output.show();
 }
 
-export function deactivate(): Promise<void> | undefined {
-  recording?.dispose();
+export function deactivate(): Promise<void> {
+  deactivating = true;
+  const whisperShutdown = whisperGate.close();
+  const preflight = sessionPreflight;
+  const activeRecording = recording;
+  const activeSegmented = segmented;
+  const runner = whisper;
+  const batchProcessing = [...activeBatchProcessing];
+  const accountings = [...sessionUsageAccountings];
   recording = undefined;
-  if (segmented) {
-    segmented.pipeline.cancel();
-    segmented.controller?.dispose();
-    segmented.releaseLease?.();
-    segmented = undefined;
-  }
-  // Reload Window gate:kill whisper server,无残留进程。
-  // v6-③:返回 dispose promise(inprocess 引擎需等在途推理 settle;server/cli 即时)
-  const disposed = whisper?.dispose();
+  preparedSession = undefined;
+  segmented = undefined;
   whisper = undefined;
-  return disposed;
+  return settleSessionShutdown({
+    cleanup: [
+      () => { sttAbort?.abort(); sttAbort = undefined; },
+      () => { cleaningAbort?.abort(); cleaningAbort = undefined; },
+      () => { preflight?.cancel(); },
+      () => activeRecording?.cancel(),
+      () => activeRecording?.dispose(),
+      () => { activeSegmented?.pipeline.cancel(); },
+      () => { activeSegmented?.controllerOwner.dispose(); },
+      () => { activeSegmented?.releaseLease?.(); },
+      () => { if (session?.active) session.dispatch('cancel'); },
+      () => { for (const accounting of accountings) finalizeSessionUsage(accounting); },
+      () => runner?.dispose(),
+    ],
+    wait: [
+      () => preflight?.settled() ?? Promise.resolve(),
+      () => Promise.allSettled(batchProcessing),
+      () => whisperShutdown,
+      ...accountings.map((accounting) => () => accounting.settled()),
+    ],
+    flush: () => translationUsageStore?.flushed() ?? Promise.resolve(),
+  });
 }

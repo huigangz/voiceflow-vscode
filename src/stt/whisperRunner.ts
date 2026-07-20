@@ -73,6 +73,10 @@ export interface TranscribeOptions {
   signal?: AbortSignal;
   /** 会话语言锁定的 per-call 覆盖(v9-⑦);缺省用 cfg.language。 */
   language?: WhisperLanguage;
+  /** Whisper 原生任务。translate 仅用于本地任意语言 → English。 */
+  task?: 'transcribe' | 'translate';
+  /** 能力路由标记;当前原生翻译仅支持 English。 */
+  translationTarget?: 'en';
 }
 
 export interface TranscribeResult {
@@ -157,8 +161,9 @@ export function buildCliArgs(cfg: {
   wavPath: string;
   language: string;
   initialPrompt: string;
+  task?: 'transcribe' | 'translate';
 }): string[] {
-  return [
+  const args = [
     '-m', cfg.modelPath,
     '-f', cfg.wavPath,
     '-l', cfg.language,
@@ -166,6 +171,8 @@ export function buildCliArgs(cfg: {
     '-nt',        // 不输出时间戳
     '-np',        // 不输出进度/系统信息到 stdout
   ];
+  if (cfg.task === 'translate') args.push('-tr');
+  return args;
 }
 
 /** server /inference 响应解析(json/verbose_json 双兼容)— 导出供单元测试。 */
@@ -390,6 +397,7 @@ export class WhisperRunner implements WhisperEngine {
     // 给出 chinese p=0.99 也输出英文翻译)——auto 必须**显式**发 'auto' 才是真自动检测
     form.append('language', language);
     form.append('prompt', this.cfg.initialPrompt);
+    if (opts.task === 'translate') form.append('translate', 'true');
 
     const t0 = Date.now();
     let res: Response;
@@ -442,6 +450,7 @@ export class WhisperRunner implements WhisperEngine {
       wavPath,
       language: opts.language ?? this.cfg.language,
       initialPrompt: this.cfg.initialPrompt,
+      task: opts.task,
     });
     const t0 = Date.now();
     const text = await new Promise<string>((resolve, reject) => {
