@@ -18,7 +18,10 @@ voiceflow-phase2-roadmap.md
 spike/
 voiceflow-inprocess-stt-plan.md
 voiceflow-chat-insert-plan.md
-# 本地设计文档(plans/specs/reviews)不进 git
-docs/
+# 本地设计文档(plans/specs/reviews)不进 git;harness PR4:只放行两份公开文档。
+# 必须写成 docs/* 而不是 docs/:父目录整体被忽略时,git 无法反向放行其中的文件。
+docs/*
+!docs/history.md
+!docs/manual-gates.md
 # harness PR2:vitest JSON 报告(test:ci 产出)
 test-results/
