@@ -2,7 +2,9 @@
 # - test:确定性前置条件先构建(build:fixtures),再以 VOICEFLOW_CI=1 跑测试 —— 前置条件缺失即失败
 #   (test/ciPrereq.ts),任何跳过必须属于硬件白名单(scripts/check-test-skips.mjs)。
 # - package:打 standard VSIX 并对产物跑 verify-package(白名单 / 精确集合 / SHA / require 冒烟)。
-# offline VSIX 不在 PR 里构建(大模型 staging + 网络重),留给 release / 手动 workflow(harness PR3)。
+# offline VSIX 不在 PR 里构建(大模型 staging + 网络重):PR 只做 package-offline --dry-run 静态校验
+# (文件名由 package.json 推导 + ignore 由 .vscodeignore 生成且差异恰为 offline-model/**);
+# 完整 offline 构建与校验在 release.yml(手动触发)。
 name: ci
 
 on:
@@ -51,6 +53,9 @@ jobs:
           if (-not (Test-Path test\fixtures\silent-helper.exe)) { Write-Error 'silent-helper.exe was not produced'; exit 1 }
 
       - run: npm run typecheck
+
+      - name: Offline packaging static check (no model download)
+        run: node scripts/package-offline.mjs --dry-run
 
       - name: Test (deterministic prerequisites required, skips must be whitelisted)
         run: npm run test:ci

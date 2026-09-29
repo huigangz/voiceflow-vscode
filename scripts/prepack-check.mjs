@@ -1,5 +1,5 @@
 /**
- * 打包前环境检查(harness PR1,fail-closed)。挂在 package / package:bundled 最前面。
+ * 打包前环境检查(harness PR1,fail-closed)。挂在 package 与 package-offline.mjs 最前面。
  *
  * ① whisper-server 残留进程:EDH 遗留进程会锁住 bin/,place-helper/fetch-whisper 覆盖时 EIO
  *    (0.3.1 打包实测,worklog release-0.3.1)。

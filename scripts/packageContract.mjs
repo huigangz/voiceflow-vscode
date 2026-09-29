@@ -33,6 +33,8 @@ const REQUIRED_EXTRA = ['package.json', 'dist/extension.js'];
 export const OFFLINE_ONNX = {
   tier: 'small-q8',
   repo: 'onnx-community/whisper-small',
+  /** HF 来源 revision(harness PR3 查实:7 文件 SHA 与此 revision 逐个一致)。fetch-offline-models 按它下载。 */
+  revision: '36050c46d777d46dc4b5f43f6d90574fc38f8732',
   dir: 'offline-model/onnx/onnx-community/whisper-small/',
   marker: '.voiceflow-complete',
   files: [
@@ -45,6 +47,47 @@ export const OFFLINE_ONNX = {
     { path: 'onnx/decoder_model_merged_quantized.onnx', sha256: 'ec07c3cbb64172c39791e26ee870a65ac22b458c36722bfe2776b3dbf741e0c9' },
   ],
 };
+
+/**
+ * offline 包内置的 whisper.cpp 模型(harness PR3:钉死文件名 + SHA,取代原先的 ggml-*.bin 文件名匹配)。
+ * fileName = src/stt/modelManager.ts MODELS.small.fileName(单测交叉校验);SHA = HF LFS oid。
+ */
+export const OFFLINE_WHISPER = {
+  tier: 'small',
+  repo: 'ggerganov/whisper.cpp',
+  revision: '5359861c739e955e79d9a303bcbc70fb988958b1',
+  path: 'offline-model/ggml-small.bin',
+  sha256: '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b',
+};
+
+/**
+ * offline 包的全部模型文件(相对扩展根)→ SHA + HF 来源。fetch-offline-models / package-offline
+ * 的唯一清单来源;不含完成标记(标记由 offlineMarkerContent() 派生)。
+ * @returns {{ path: string, sha256: string, repo: string, revision: string, repoPath: string }[]}
+ */
+export function offlineModelFiles() {
+  const whisperRepoPath = OFFLINE_WHISPER.path.slice('offline-model/'.length);
+  return [
+    { path: OFFLINE_WHISPER.path, sha256: OFFLINE_WHISPER.sha256, repo: OFFLINE_WHISPER.repo, revision: OFFLINE_WHISPER.revision, repoPath: whisperRepoPath },
+    ...OFFLINE_ONNX.files.map((f) => ({
+      path: OFFLINE_ONNX.dir + f.path,
+      sha256: f.sha256,
+      repo: OFFLINE_ONNX.repo,
+      revision: OFFLINE_ONNX.revision,
+      repoPath: f.path,
+    })),
+  ];
+}
+
+/**
+ * VSIX 文件名 —— 版本只来自 package.json(harness PR3 §8.3:唯一版本 source of truth)。
+ * vsce --target win32-x64 的默认命名为 `${name}-win32-x64-${version}.vsix`;offline 加 -offline。
+ */
+export function vsixFileName({ name, version }, variant) {
+  if (variant !== 'standard' && variant !== 'offline') throw new Error(`unknown variant: ${variant}`);
+  if (!name || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version ?? '')) throw new Error(`package.json name/version 无效: ${name}@${version}`);
+  return `${name}-win32-x64-${version}${variant === 'offline' ? '-offline' : ''}.vsix`;
+}
 
 /** 规范标记内容 —— 与 src/stt/onnxModels.ts markerContent() 同构(单测交叉校验逐字相等)。 */
 export function offlineMarkerContent() {
@@ -120,12 +163,13 @@ export function checkEntries({ entries, variant, manifest }) {
   const mediaExpected = new Set(Object.keys(manifest.runtimeAssets ?? {}).filter((p) => p.startsWith('media/')));
   const nmExpected = nodeModulesExpected(manifest);
   const onnxExpected = new Set([...OFFLINE_ONNX.files.map((f) => f.path), OFFLINE_ONNX.marker].map((p) => OFFLINE_ONNX.dir + p));
+  const offlineExpected = new Set([...onnxExpected, OFFLINE_WHISPER.path]);
   for (const f of files) {
     if (f.startsWith('bin/') && !binExpected.has(f)) errors.push(`[bin] manifest 外文件: ${f}`);
     if (f.startsWith('media/') && !mediaExpected.has(f)) errors.push(`[media] runtimeAssets 外文件: ${f}`);
     if (f.startsWith('dist/') && !/^dist\/[^/]+\.js$/.test(f)) errors.push(`[dist] 非 bundle 文件: ${f}`);
     if (f.startsWith('node_modules/') && !nmExpected.has(f)) errors.push(`[node_modules] 运行时清单外文件: ${f}`);
-    if (variant === 'offline' && f.startsWith('offline-model/') && !onnxExpected.has(f) && !/^offline-model\/ggml-[^/]+\.bin$/.test(f)) {
+    if (variant === 'offline' && f.startsWith('offline-model/') && !offlineExpected.has(f)) {
       errors.push(`[offline-model] 清单外文件: ${f}`);
     }
     for (const [re, label] of FORBIDDEN_ANYWHERE) if (re.test(f)) errors.push(`[forbidden] ${label}: ${f}`);
@@ -137,8 +181,8 @@ export function checkEntries({ entries, variant, manifest }) {
   for (const r of required) if (!fileSet.has(r)) errors.push(`[required] 缺失: ${r}`);
   if (!files.some((f) => /^license(\.txt)?$/i.test(f))) errors.push('[required] 缺失: LICENSE');
   if (!files.some((f) => f.toLowerCase() === 'third-party-notices.md')) errors.push('[required] 缺失: THIRD-PARTY-NOTICES.md');
-  if (variant === 'offline' && !files.some((f) => /^offline-model\/ggml-[^/]+\.bin$/.test(f))) {
-    errors.push('[required] offline 缺 whisper 模型: offline-model/ggml-*.bin');
+  if (variant === 'offline' && !fileSet.has(OFFLINE_WHISPER.path)) {
+    errors.push(`[required] offline 缺 whisper 模型: ${OFFLINE_WHISPER.path}`);
   }
 
   return errors;
@@ -179,6 +223,7 @@ export function hashExpectations(manifest, variant = 'standard') {
   for (const [p, meta] of Object.entries(manifest.nodeAddons ?? {})) m.set(p, meta.sha256);
   for (const [p, meta] of Object.entries(manifest.runtimeAssets ?? {})) m.set(p, meta.sha256);
   if (variant === 'offline') {
+    m.set(OFFLINE_WHISPER.path, OFFLINE_WHISPER.sha256);
     for (const f of OFFLINE_ONNX.files) m.set(OFFLINE_ONNX.dir + f.path, f.sha256);
     // 标记按内容校验:期望 SHA = 规范内容的 SHA(空 / 过期 / 手改的标记都会不匹配)
     m.set(OFFLINE_ONNX.dir + OFFLINE_ONNX.marker, createHash('sha256').update(offlineMarkerContent()).digest('hex'));

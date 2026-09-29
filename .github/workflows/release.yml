@@ -1,0 +1,93 @@
+# harness PR3:完整 release 构建与校验(仅手动触发)。
+# - 与 ci.yml 相同的测试门槛(确定性前置条件必需、跳过须在白名单)。
+# - standard VSIX:npm run package(prepack-check → vsce → verify-package standard)。
+# - offline VSIX:按钉死 revision 拉模型(fetch-offline-models,缓存命中也逐文件校验 SHA)
+#   → package-offline.mjs(ignore 由 .vscodeignore 生成 → 预检 → vsce → verify-package offline)。
+# - 产出两个 VSIX + SHA256SUMS.txt 作为 workflow artifact。**不创建 GitHub Release(草稿也不建)**:
+#   发布是对外动作,由人下载 artifact 核对后手动完成。
+# 注意:workflow_dispatch 只能在默认分支上已存在的 workflow 上触发 —— 本文件合并进 main 后才可运行。
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VOICEFLOW_CI: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Check csc.exe (for build:fixtures)
+        shell: pwsh
+        run: |
+          $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { Write-Error "csc.exe not found at $csc (runner image changed?)"; exit 1 }
+
+      - run: npm ci
+
+      - name: Build deterministic fixtures
+        shell: pwsh
+        run: |
+          npm run build:fixtures
+          if (-not (Test-Path test\fixtures\silent-helper.exe)) { Write-Error 'silent-helper.exe was not produced'; exit 1 }
+
+      - run: npm run typecheck
+
+      - name: Test (deterministic prerequisites required, skips must be whitelisted)
+        run: npm run test:ci
+
+      - name: Package standard VSIX and verify the artifact
+        run: npm run package
+
+      # key 由全部模型 SHA 派生:清单一变就换 key;命中后 fetch 仍逐文件校验 SHA(缓存不被信任)
+      - name: Offline model cache key
+        id: models
+        shell: pwsh
+        run: '"key=$(node scripts/fetch-offline-models.mjs --cache-key)" >> $env:GITHUB_OUTPUT'
+
+      - uses: actions/cache@v6
+        with:
+          path: offline-model
+          key: ${{ steps.models.outputs.key }}
+
+      - name: Fetch offline models (pinned revisions, SHA verified)
+        run: npm run fetch-offline-models
+
+      - name: Package offline VSIX and verify the artifact
+        run: npm run package:offline
+
+      - name: SHA256SUMS
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem -File *.vsix | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          if ($lines.Count -ne 2) { Write-Error "expected exactly 2 VSIX files, found $($lines.Count)"; exit 1 }
+          Set-Content -Path SHA256SUMS.txt -Value $lines -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            *.vsix
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
