@@ -286,6 +286,7 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:ci": "vitest run --reporter=default --reporter=json --outputFile.json=test-results/vitest.json && node scripts/check-test-skips.mjs test-results/vitest.json",
     "bench": "node scripts/bench-server.mjs",
     "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
     "package": "node scripts/prepack-check.mjs && vsce package --target win32-x64 && node scripts/verify-package.mjs --variant standard",

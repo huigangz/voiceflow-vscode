@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configureInprocessEnv, resolveInprocessPaths } from '../src/stt/onnxModels';
+import { requireInCi } from './ciPrereq';
 
 function canRun(): boolean {
   try {
@@ -20,7 +21,8 @@ function canRun(): boolean {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe.skipIf(!canRun())('inprocess 禁网(真 transformers.js)', () => {
+// 确定性隐私不变量:依赖拓扑变化导致 transformers 缺失时,CI 必须失败而不是悄悄跳过
+describe.skipIf(!requireInCi(canRun(), '@huggingface/transformers 未安装(隐私不变量:缺本地模型时零网络请求)'))('inprocess 禁网(真 transformers.js)', () => {
   it('缺文件 → 本地报错且零 fetch(评审 ④ fail-closed)', async () => {
     const { env, pipeline } = await import('@huggingface/transformers');
     const modelsDir = mkdtempSync(join(tmpdir(), 'vf-nonet-'));

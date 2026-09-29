@@ -3,7 +3,7 @@
  * (真实 claude/codex CLI 调用属 S3b 人工清单。)
  */
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -38,7 +38,9 @@ async function createNpmShimFixture(name: string): Promise<{
   ps1Path: string;
   cliPath: string;
 }> {
-  const directory = await mkdtemp(join(tmpdir(), 'voiceflow-cli-shim-'));
+  // realpath:被测代码按设计用 realpath 规范化 shim 目标;runner 的 TEMP 是 8.3 短名(RUNNER~1),
+  // 不规范化的话期望路径与实际(runneradmin)不相等(harness PR2 首次 CI 运行发现)
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'voiceflow-cli-shim-')));
   const cmdPath = join(directory, `${name}.cmd`);
   const ps1Path = join(directory, `${name}.ps1`);
   const cliPath = join(directory, 'cli.js');
