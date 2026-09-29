@@ -92,8 +92,11 @@ export function configureInprocessEnv(
   env.localModelPath = localModelPath;
 }
 
-/** 标记文件内容:与清单绑定,清单升级(文件/SHA 变化)自动判不就绪。 */
-function markerContent(spec: InprocessModelSpec): string {
+/**
+ * 标记文件内容:与清单绑定,清单升级(文件/SHA 变化)自动判不就绪。
+ * export 仅供 test/packageContract.test.ts 与 offline VSIX 契约交叉校验。
+ */
+export function markerContent(spec: InprocessModelSpec): string {
   return JSON.stringify(
     { tier: spec.tier, repo: spec.repo, files: Object.fromEntries(spec.files.map((f) => [f.path, f.sha256])) },
     null,

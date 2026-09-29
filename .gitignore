@@ -1,5 +1,7 @@
 node_modules/
-media/vad/
+# harness PR1:VAD 模型随 git 提交(来源/SHA 见 bin.manifest.json runtimeAssets),其余 vad-web 残留忽略
+media/vad/*
+!media/vad/silero_vad_v5.onnx
 bin/
 dist/
 *.vsix
@@ -16,3 +18,5 @@ voiceflow-phase2-roadmap.md
 spike/
 voiceflow-inprocess-stt-plan.md
 voiceflow-chat-insert-plan.md
+# 本地设计文档(plans/specs/reviews)不进 git
+docs/

@@ -11,6 +11,9 @@
  * ⑤ inproc-s5(v4-②):onnxruntime-node 依赖树**单副本**(transformers.js 自带 1.21,
  *    overrides 钉到仓库 1.27;嵌套副本出现 = overrides 失效/依赖漂移 → 双 DLL 风险)。
  * ⑥ inproc-s5:@huggingface/transformers 安装在位(esbuild 打进 bundle 的构建期依赖)。
+ * ⑦ harness PR1:manifest.runtimeAssets(随 git 提交的运行时资产,如 Silero VAD 模型)
+ *    逐一校验 存在 + 尺寸 + SHA-256。
+ * ⑧ harness PR1:manifest.nodeRuntime(打洞包的 JS/package.json 清单)—— 本地包版本与清单一致、文件在位。
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -93,11 +96,42 @@ if (ortCopies.length !== 1) {
 const tfCjs = join(root, 'node_modules/@huggingface/transformers/dist/transformers.node.cjs');
 if (!existsSync(tfCjs)) errors.push('@huggingface/transformers 缺失(先 npm install;esbuild 需要它进 bundle)');
 
+// ⑧ nodeRuntime:打洞包版本 == 清单固定版本(升级 pin 而未重生成 JS 清单 → 打包前就失败),清单文件在位
+for (const [dir, meta] of Object.entries(manifest.nodeRuntime ?? {})) {
+  if (dir.startsWith('_')) continue;
+  const pkgPath = join(root, dir, 'package.json');
+  if (!existsSync(pkgPath)) {
+    errors.push(`nodeRuntime 包缺失: ${dir}(先 npm install)`);
+    continue;
+  }
+  const { name, version } = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  if (`${name}@${version}` !== meta.package) {
+    errors.push(`nodeRuntime 版本漂移: ${dir} 本地 ${name}@${version} ≠ 清单 ${meta.package}(升级须重生成 files 清单并跑 verify-package 冒烟)`);
+  }
+  for (const f of meta.files) if (!existsSync(join(root, dir, f))) errors.push(`nodeRuntime 文件缺失: ${dir}/${f}`);
+}
+
+// ⑦ runtimeAssets(路径相对仓库根)
+const assetCount = Object.keys(manifest.runtimeAssets ?? {}).length;
+for (const [relPath, meta] of Object.entries(manifest.runtimeAssets ?? {})) {
+  const p = join(root, relPath);
+  if (!existsSync(p)) {
+    errors.push(`runtimeAsset 缺失: ${relPath}(随 git 提交;来源 ${meta.url})`);
+    continue;
+  }
+  const size = statSync(p).size;
+  if (size !== meta.size) errors.push(`runtimeAsset 尺寸不符: ${relPath}(期望 ${meta.size},实际 ${size})`);
+  const h = createHash('sha256').update(readFileSync(p)).digest('hex');
+  if (h !== meta.sha256) {
+    errors.push(`runtimeAsset SHA-256 不匹配: ${relPath}\n    期望 ${meta.sha256}\n    实际 ${h}\n    (来源 ${meta.source} ${meta.version})`);
+  }
+}
+
 if (errors.length > 0) {
   console.error(`[verify-bin] FAIL —— 与 manifest 不符(${errors.length} 项):`);
   for (const e of errors) console.error(`  - ${e}`);
   process.exit(1);
 }
 console.log(
-  `[verify-bin] OK: bin/ ${expected.size} 文件 + nodeAddons ${addonCount} 项 + ORT 单副本 + transformers 在位,校验全部通过`,
+  `[verify-bin] OK: bin/ ${expected.size} 文件 + nodeAddons ${addonCount} 项 + nodeRuntime 版本/清单 + runtimeAssets ${assetCount} 项 + ORT 单副本 + transformers 在位,校验全部通过`,
 );

@@ -47,5 +47,69 @@
       "sha256": "273f9ef9cf755c6a0f342226a80448156c10ceb74db2ae8c8370dc98e75af0eb",
       "_note": "P2c:CPU EP;DirectML 三 DLL 不随包分发(GPU EP 不使用,解包 require+推理硬性项验证)"
     }
+  },
+  "nodeRuntime": {
+    "_comment": "harness PR1 review-P1:打洞运行时 JS/package.json 精确清单(不含 nodeAddons 里的二进制)。VSIX 内 node_modules = 本清单 ∪ nodeAddons,多一个少一个都 FAIL;verify-bin 校验本地包版本 == package,升级 pin 时须重新生成清单(对照新包的 main/exports 闭包)并跑 verify-package 的 require 冒烟。",
+    "node_modules/@picovoice/pvrecorder-node": {
+      "package": "@picovoice/pvrecorder-node@1.2.9",
+      "files": [
+        "dist/errors.js",
+        "dist/index.js",
+        "dist/platforms.js",
+        "dist/pv_recorder.js",
+        "dist/pv_recorder_status_t.js",
+        "package.json"
+      ]
+    },
+    "node_modules/onnxruntime-node": {
+      "package": "onnxruntime-node@1.27.0",
+      "files": [
+        "dist/backend.js",
+        "dist/binding.js",
+        "dist/index.js",
+        "dist/version.js",
+        "package.json"
+      ]
+    },
+    "node_modules/onnxruntime-common": {
+      "package": "onnxruntime-common@1.27.0",
+      "files": [
+        "dist/cjs/backend-impl.js",
+        "dist/cjs/backend.js",
+        "dist/cjs/env-impl.js",
+        "dist/cjs/env.js",
+        "dist/cjs/index.js",
+        "dist/cjs/inference-session-impl.js",
+        "dist/cjs/inference-session.js",
+        "dist/cjs/onnx-model.js",
+        "dist/cjs/onnx-value.js",
+        "dist/cjs/package.json",
+        "dist/cjs/tensor-conversion-impl.js",
+        "dist/cjs/tensor-conversion.js",
+        "dist/cjs/tensor-factory-impl.js",
+        "dist/cjs/tensor-factory.js",
+        "dist/cjs/tensor-impl-type-mapping.js",
+        "dist/cjs/tensor-impl.js",
+        "dist/cjs/tensor-utils-impl.js",
+        "dist/cjs/tensor-utils.js",
+        "dist/cjs/tensor.js",
+        "dist/cjs/trace.js",
+        "dist/cjs/type-helper.js",
+        "dist/cjs/version.js",
+        "package.json"
+      ]
+    }
+  },
+  "runtimeAssets": {
+    "media/vad/silero_vad_v5.onnx": {
+      "source": "snakers4/silero-vad",
+      "version": "v5.1.2",
+      "commit": "6478567951ae5c9979ad7b234185b5515f4be7a1",
+      "url": "https://raw.githubusercontent.com/snakers4/silero-vad/6478567951ae5c9979ad7b234185b5515f4be7a1/src/silero_vad/data/silero_vad.onnx",
+      "license": "MIT",
+      "size": 2327524,
+      "sha256": "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f",
+      "_note": "harness PR1:文件随 git 提交(47ee8e9 起),本条记录来源 + 固定 SHA。v5.1/v5.1.1/v5.1.2 同字节;v6.0 与 master 已换模型 → URL 必须钉 commit。升级需同步 sileroVad.ts 输入签名检查与本 SHA"
+    }
   }
 }
