@@ -1,5 +1,5 @@
 # 只打包运行所需:dist(bundled)+ bin(whisper 二进制)+ pvrecorder 最小运行时(打洞)。
-# 注意:与 .vscodeignore-offline 保持同步(唯一差异:offline 版不排除 offline-model/**)。
+# offline VSIX 的 ignore 由本文件生成(scripts/package-offline.mjs:删掉 # @offline-include 及其下一行),仓库内只此一份。
 .vscode/**
 .claude/**
 .gitignore
@@ -51,7 +51,8 @@ voiceflow-vscode-spec-*.md
 CLAUDE.md
 models/**
 *.vsix
-# 评审 v7-①:普通 package 永不带模型(不再依赖"目录为空");offline 打包用 .vscodeignore-offline
+# 评审 v7-①:普通 package 永不带模型(不再依赖"目录为空")。下一行标记供 offline 生成器定位,勿删勿挪。
+# @offline-include
 offline-model/**
 voiceflow-inprocess-stt-plan.md
 voiceflow-chat-insert-plan.md

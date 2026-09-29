@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { MODELS } from '../src/stt/modelManager';
 import { INPROCESS_MODELS, markerContent } from '../src/stt/onnxModels';
 
 // 测试文件按 CommonJS 编译(tsconfig module=Node16,无 type:module),静态 import .mjs 会被 tsc 拒绝 → 动态加载
@@ -15,10 +16,22 @@ let hashExpectations: Contract['hashExpectations'];
 let smokeScript: Contract['smokeScript'];
 let OFFLINE_ONNX: Contract['OFFLINE_ONNX'];
 let offlineMarkerContent: Contract['offlineMarkerContent'];
+let OFFLINE_WHISPER: Contract['OFFLINE_WHISPER'];
+let offlineModelFiles: Contract['offlineModelFiles'];
+let vsixFileName: Contract['vsixFileName'];
 beforeAll(async () => {
-  ({ checkEntries, checkSize, checkVersion, hashExpectations, smokeScript, OFFLINE_ONNX, offlineMarkerContent } = await import(
-    '../scripts/packageContract.mjs'
-  ));
+  ({
+    checkEntries,
+    checkSize,
+    checkVersion,
+    hashExpectations,
+    smokeScript,
+    OFFLINE_ONNX,
+    offlineMarkerContent,
+    OFFLINE_WHISPER,
+    offlineModelFiles,
+    vsixFileName,
+  } = await import('../scripts/packageContract.mjs'));
 });
 
 const manifest = {
@@ -171,6 +184,16 @@ describe('package contract: entries', () => {
     expect(errs.join()).toMatch(/\[offline-model\] 清单外文件/);
   });
 
+  it('PR3:whisper 模型钉死为 ggml-small.bin —— 换成其他 ggml-*.bin 或多带一个都 FAIL', () => {
+    const swapped = goodOffline().map((e) => e.replace('ggml-small.bin', 'ggml-base.bin'));
+    const errs = check(swapped, 'offline');
+    expect(errs).toContain('[offline-model] 清单外文件: offline-model/ggml-base.bin');
+    expect(errs).toContain('[required] offline 缺 whisper 模型: offline-model/ggml-small.bin');
+    expect(check([...goodOffline(), 'extension/offline-model/ggml-small-q5_1.bin'], 'offline')).toEqual([
+      '[offline-model] 清单外文件: offline-model/ggml-small-q5_1.bin',
+    ]);
+  });
+
   it('未 strip extension/ 前缀的列表不会"空转通过"', () => {
     const stripped = goodStandard().map((e) => e.replace(/^extension\//, ''));
     expect(check(stripped).length).toBeGreaterThan(0);
@@ -195,6 +218,18 @@ describe('package contract: version / size / hashes', () => {
     expect(checkVersion({ ...ok, variant: 'offline', fileName: 'voiceflow-vscode-win32-x64-0.3.1-offline.vsix' })).toEqual([]);
   });
 
+  it('PR3:文件名只由 package.json 推导,且与 checkVersion 的期望一致', () => {
+    const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+    for (const variant of ['standard', 'offline'] as const) {
+      const fileName = vsixFileName(pkg, variant);
+      expect(fileName.startsWith(`${pkg.name}-win32-x64-${pkg.version}`)).toBe(true);
+      expect(checkVersion({ repoVersion: pkg.version, innerVersion: pkg.version, fileName, variant })).toEqual([]);
+    }
+    expect(vsixFileName({ name: 'x', version: '1.2.3-rc.1' }, 'offline')).toBe('x-win32-x64-1.2.3-rc.1-offline.vsix');
+    expect(() => vsixFileName({ name: 'x', version: '' }, 'standard')).toThrow();
+    expect(() => vsixFileName({ name: 'x', version: '1.2.3' }, 'y' as never)).toThrow();
+  });
+
   it('尺寸预算', () => {
     const MB = 1024 * 1024;
     expect(checkSize({ bytes: 16 * MB, variant: 'standard' })).toEqual([]);
@@ -203,10 +238,11 @@ describe('package contract: version / size / hashes', () => {
     expect(checkSize({ bytes: 16 * MB, variant: 'offline' })).toHaveLength(1);
   });
 
-  it('offline 的 SHA 期望额外覆盖 7 个 ONNX 文件 + 完成标记(按规范内容)', () => {
+  it('offline 的 SHA 期望额外覆盖 whisper 模型 + 7 个 ONNX 文件 + 完成标记(按规范内容)', () => {
     const std = hashExpectations(manifest, 'standard');
     const off = hashExpectations(manifest, 'offline');
-    expect(off.size - std.size).toBe(8);
+    expect(off.size - std.size).toBe(9);
+    expect(off.get('offline-model/ggml-small.bin')).toBe(OFFLINE_WHISPER.sha256);
     const sha = (t: string) => createHash('sha256').update(t).digest('hex');
     const markerSha = off.get('offline-model/onnx/onnx-community/whisper-small/.voiceflow-complete');
     expect(markerSha).toBe(sha(offlineMarkerContent()));
@@ -232,6 +268,28 @@ describe('package contract: 与真实来源交叉校验', () => {
     const spec = INPROCESS_MODELS['small-q8'];
     expect(OFFLINE_ONNX.dir).toBe(`offline-model/onnx/${spec.repo}/`);
     expect(OFFLINE_ONNX.files).toEqual(spec.files.map((f) => ({ path: f.path, sha256: f.sha256 })));
+  });
+
+  it('PR3:OFFLINE_WHISPER 文件名 = modelManager 的 small 档(默认档位)', () => {
+    expect(OFFLINE_WHISPER.tier).toBe('small');
+    expect(OFFLINE_WHISPER.path).toBe(`offline-model/${MODELS.small.fileName}`);
+    expect(OFFLINE_WHISPER.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('PR3:offlineModelFiles = whisper + 7 个 ONNX,来源 revision 钉死为 commit SHA', () => {
+    const files = offlineModelFiles();
+    expect(files).toHaveLength(1 + OFFLINE_ONNX.files.length);
+    expect(new Set(files.map((f) => f.path)).size).toBe(files.length);
+    for (const f of files) {
+      expect(f.path.startsWith('offline-model/')).toBe(true);
+      expect(f.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(f.revision).toMatch(/^[0-9a-f]{40}$/); // 不是 main 之类的可变分支名
+    }
+    expect(files[0]).toMatchObject({ repo: 'ggerganov/whisper.cpp', repoPath: 'ggml-small.bin' });
+    expect(files.slice(1).map((f) => OFFLINE_ONNX.dir + f.repoPath)).toEqual(files.slice(1).map((f) => f.path));
+    // 与 SHA 期望表一致:下载校验与产物校验用的是同一份清单
+    const off = hashExpectations(manifest, 'offline');
+    for (const f of files) expect(off.get(f.path)).toBe(f.sha256);
   });
 
   it('review-2:规范完成标记与运行时 markerContent() 逐字相等(运行时 isInprocessModelReady 逐字比较)', () => {

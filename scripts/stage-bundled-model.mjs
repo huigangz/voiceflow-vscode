@@ -21,7 +21,7 @@ const argv = process.argv.slice(2);
 const getArg = (k) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
 
 // 评审 v7-①:本脚本**永不删除任何文件**。普通 package 不带模型靠 .vscodeignore 排除
-// offline-model/**;offline 打包用 --ignoreFile .vscodeignore-offline。暂存模型留盘复用,
+// offline-model/**;offline 打包用由 .vscodeignore 生成的 ignore(package-offline.mjs)。暂存模型留盘复用,
 // 需要清理时由用户手动删。
 if (argv.includes('--clean')) {
   console.error('[stage-model] --clean 已移除(评审 v7-①:脚本不做自动删除)。暂存模型请手动清理。');

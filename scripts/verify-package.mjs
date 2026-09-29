@@ -7,7 +7,7 @@
  * 校验:条目契约(根目录白名单 / 目录精确集合 / 必需文件 / variant 分支,见 packageContract.mjs)
  *       + 版本一致性(仓库 package.json == VSIX 内 package.json == 文件名)
  *       + 尺寸预算 + 产物内 SHA-256(bin / nodeAddons / runtimeAssets 对照 bin.manifest.json;
- *       offline 另含 ONNX 模型 7 文件)+ require 冒烟(解出 node_modules 真正加载打洞包)。
+ *       offline 另含 whisper 模型 + ONNX 模型 7 文件)+ require 冒烟(解出 node_modules 真正加载打洞包)。
  *
  * 不挂 vscode:prepublish:那一步在 vsce 打包过程中执行,VSIX 尚不存在。
  * 列条目用 Windows 自带 bsdtar(System32\tar.exe 能读 zip);Git Bash 的 GNU tar 读不了 zip,
@@ -19,7 +19,7 @@ import { createReadStream, existsSync, mkdirSync, readFileSync, statSync } from 
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkEntries, checkSize, checkVersion, hashExpectations, smokeScript } from './packageContract.mjs';
+import { checkEntries, checkSize, checkVersion, hashExpectations, smokeScript, vsixFileName } from './packageContract.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(root, 'bin.manifest.json'), 'utf8'));
@@ -33,9 +33,7 @@ if (variant !== 'standard' && variant !== 'offline') {
   process.exit(1);
 }
 const positional = argv.filter((a, i) => !a.startsWith('--') && i !== vi + 1);
-const vsix = resolve(
-  positional[0] ?? join(root, `${pkg.name}-win32-x64-${pkg.version}${variant === 'offline' ? '-offline' : ''}.vsix`),
-);
+const vsix = resolve(positional[0] ?? join(root, vsixFileName(pkg, variant)));
 if (!existsSync(vsix)) {
   console.error(`[verify-package] FATAL: 找不到 ${vsix}`);
   process.exit(1);
