@@ -295,7 +295,8 @@
     "package:offline": "node scripts/package-offline.mjs",
     "fetch-offline-models": "node scripts/fetch-offline-models.mjs",
     "verify-package": "node scripts/verify-package.mjs",
-    "prepack-check": "node scripts/prepack-check.mjs"
+    "prepack-check": "node scripts/prepack-check.mjs",
+    "verify-docs": "node scripts/verify-doc-structure.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
