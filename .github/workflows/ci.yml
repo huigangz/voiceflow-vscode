@@ -1,0 +1,93 @@
+# harness PR2:PR 级 Windows CI。
+# - test:确定性前置条件先构建(build:fixtures),再以 VOICEFLOW_CI=1 跑测试 —— 前置条件缺失即失败
+#   (test/ciPrereq.ts),任何跳过必须属于硬件白名单(scripts/check-test-skips.mjs)。
+# - package:打 standard VSIX 并对产物跑 verify-package(白名单 / 精确集合 / SHA / require 冒烟)。
+# offline VSIX 不在 PR 里构建(大模型 staging + 网络重),留给 release / 手动 workflow(harness PR3)。
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      VOICEFLOW_CI: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      # build:fixtures 依赖系统自带的 .NET Framework csc;不预设 runner 镜像永远提供它 ——
+      # 缺失时明确失败(否则 silent-helper 缺失会让 watchdog 覆盖悄悄下降)。
+      - name: Check csc.exe (for build:fixtures)
+        shell: pwsh
+        run: |
+          $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { Write-Error "csc.exe not found at $csc (runner image changed?)"; exit 1 }
+          Write-Host "csc.exe $((Get-Item $csc).VersionInfo.FileVersion)"
+
+      - run: npm ci
+
+      - name: Build deterministic fixtures
+        shell: pwsh
+        run: |
+          npm run build:fixtures
+          if (-not (Test-Path test\fixtures\silent-helper.exe)) { Write-Error 'silent-helper.exe was not produced'; exit 1 }
+
+      - run: npm run typecheck
+
+      - name: Test (deterministic prerequisites required, skips must be whitelisted)
+        run: npm run test:ci
+
+      - run: npm run build
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report
+          path: test-results/vitest.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # prepack-check → vsce package(prepublish:place-helper → fetch-whisper[SHA] → verify-bin → build)
+      # → verify-package --variant standard
+      - name: Package standard VSIX and verify the artifact
+        run: npm run package
+
+      - name: Upload standard VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-standard
+          path: voiceflow-vscode-win32-x64-*.vsix
+          if-no-files-found: error
+          retention-days: 7

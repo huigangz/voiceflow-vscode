@@ -23,6 +23,8 @@ docs/**
 *.log
 release-notes-*.md
 PLAN-*.md
+test-results/**
+.github/**
 node_modules/**
 !node_modules/@picovoice/pvrecorder-node/package.json
 !node_modules/@picovoice/pvrecorder-node/dist/**/*.js

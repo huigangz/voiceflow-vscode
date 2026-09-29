@@ -20,3 +20,5 @@ voiceflow-inprocess-stt-plan.md
 voiceflow-chat-insert-plan.md
 # 本地设计文档(plans/specs/reviews)不进 git
 docs/
+# harness PR2:vitest JSON 报告(test:ci 产出)
+test-results/
