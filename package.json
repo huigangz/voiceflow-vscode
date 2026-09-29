@@ -288,9 +288,11 @@
     "test": "vitest run",
     "bench": "node scripts/bench-server.mjs",
     "vscode:prepublish": "npm run build:helper && npm run build:whisper && npm run verify-bin && npm run build",
-    "package": "vsce package --target win32-x64",
+    "package": "node scripts/prepack-check.mjs && vsce package --target win32-x64 && node scripts/verify-package.mjs --variant standard",
     "stage-model": "node scripts/stage-bundled-model.mjs",
-    "package:bundled": "node scripts/stage-bundled-model.mjs && node scripts/stage-bundled-model.mjs --onnx && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.3.1-offline.vsix"
+    "package:bundled": "node scripts/prepack-check.mjs && node scripts/stage-bundled-model.mjs && node scripts/stage-bundled-model.mjs --onnx && vsce package --target win32-x64 --ignoreFile .vscodeignore-offline -o voiceflow-vscode-win32-x64-0.3.1-offline.vsix && node scripts/verify-package.mjs --variant offline",
+    "verify-package": "node scripts/verify-package.mjs",
+    "prepack-check": "node scripts/prepack-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
