@@ -9,8 +9,9 @@ let checkPathRefs: Mod['checkPathRefs'];
 let extractSrcLayout: Mod['extractSrcLayout'];
 let checkSrcLayout: Mod['checkSrcLayout'];
 let srcTopLevel: Mod['srcTopLevel'];
+let gitIgnored: Mod['gitIgnored'];
 beforeAll(async () => {
-  ({ isPathLike, extractPathRefs, checkPathRefs, extractSrcLayout, checkSrcLayout, srcTopLevel } = await import(
+  ({ isPathLike, extractPathRefs, checkPathRefs, extractSrcLayout, checkSrcLayout, srcTopLevel, gitIgnored } = await import(
     '../scripts/verify-doc-structure.mjs'
   ));
 });
@@ -102,6 +103,14 @@ describe('src 顶层结构', () => {
 });
 
 describe('真实仓库', () => {
+  it('回归(PR4 CI 首跑):目录型 ignore 规则对不存在的目录也能判定 —— 必须保留尾部 /', () => {
+    // .vscode-test/ 在 .gitignore 里是目录型规则,且平时不存在(与 clean clone 里的 worklog/ 同一处境)
+    expect(gitIgnored(process.cwd(), '.vscode-test/')).toBe(true);
+    expect(gitIgnored(process.cwd(), 'worklog/')).toBe(true);
+    expect(gitIgnored(process.cwd(), 'docs/plans/')).toBe(true);
+    expect(gitIgnored(process.cwd(), 'src/')).toBe(false);
+  });
+
   it('CLAUDE.md 通过机械检查(路径引用 + src 顶层结构)', () => {
     const out = execFileSync(process.execPath, ['scripts/verify-doc-structure.mjs'], { encoding: 'utf8' });
     expect(out).toMatch(/OK —— CLAUDE\.md/);

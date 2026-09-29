@@ -120,6 +120,20 @@ export function checkSrcLayout(entries, trackedFiles) {
   return errors;
 }
 
+/**
+ * 路径是否被 .gitignore 覆盖。**保留尾部 `/`**:目录型规则(如 `worklog/`)在路径不存在时
+ * (clean clone / CI)只对带尾斜杠的查询生效;去掉斜杠 → git 不知道它是目录 → 判"未忽略"
+ * (本机目录存在所以绿、CI 红 —— PR4 首跑实测)。
+ */
+export function gitIgnored(root, path) {
+  try {
+    execFileSync('git', ['check-ignore', '-q', path], { cwd: root, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---- CLI ----
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -127,14 +141,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const markdown = readFileSync(resolve(root, docPath), 'utf8');
   const git = (args, opts = {}) => execFileSync('git', args, { cwd: root, encoding: 'utf8', ...opts });
   const tracked = new Set(git(['ls-files', '-z']).split('\0').filter(Boolean));
-  const isIgnored = (p) => {
-    try {
-      git(['check-ignore', '-q', p.replace(/\/+$/, '')], { stdio: 'ignore' });
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const isIgnored = (p) => gitIgnored(root, p);
 
   const refs = extractPathRefs(markdown);
   const layout = extractSrcLayout(markdown);
