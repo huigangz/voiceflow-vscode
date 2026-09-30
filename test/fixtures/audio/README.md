@@ -16,13 +16,13 @@
 
 ## 文件
 
-| 文件 | 内容 | 来源 | 生成 |
-|---|---|---|---|
-| `speech-en-tts.wav` | 1.0s 静音 + 英文句 A + 2.0s 静音 + 英文句 B + 1.0s 静音,共 11.66s | 合成:Windows SAPI 5(System.Speech),语音 Microsoft Zira Desktop | `node scripts/gen-audio-fixtures.mjs` |
+| 文件 | 内容 | 来源 | 生成 | SHA-256 |
+|---|---|---|---|---|
+| `speech-en-tts.wav` | 1.0s 静音 + 英文句 A + 2.0s 静音 + 英文句 B + 1.0s 静音,共 11.66s | 合成:Windows SAPI 5(System.Speech),语音 Microsoft Zira Desktop | `node scripts/gen-audio-fixtures.mjs` | `f31964dadb50e91f02f5da30ddd29c7e6846aaa46624f8169d50a4aa01fda4c5` |
 
-句子文本、精确区段(样本号)与 SHA 见 `fixtures.json`。静音段为全零样本;语音段是裁掉首尾静音的合成语音。
+句子文本与精确区段(样本号)见 `fixtures.json`。静音段为全零样本;语音段是裁掉首尾静音的合成语音。
 
-生成脚本只在 Windows 本机运行,不进 CI:不同 Windows 版本的合成结果字节可能不同,以提交的文件和清单里的 SHA 为准。重新生成后清单会一起更新,需在同一提交里说明原因。
+生成脚本只在 Windows 本机运行,不进 CI:不同 Windows 版本的合成结果字节可能不同,以提交的文件和清单里的 SHA 为准。重新生成后清单会一起更新;本表的 SHA 需手动同步(测试会校验 README 含清单里每个 SHA),并在同一提交里说明原因。
 
 ## 用途
 

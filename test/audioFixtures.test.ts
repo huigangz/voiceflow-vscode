@@ -52,6 +52,14 @@ describe('audioFixtures 纯函数', () => {
     expect(() => m.decodeWav(m.encodeWav(new Int16Array(4)).subarray(0, 36))).toThrow(/data/);
   });
 
+  it('decodeWav 奇数长度 data(残缺 PCM16 样本)→ 抛错;checkFixtureEntry 报解析失败', () => {
+    const head = m.encodeWav(new Int16Array(0)).subarray(0, 40); // RIFF + fmt + 'data' 标记
+    const odd = Buffer.concat([head, Buffer.from([3, 0, 0, 0]), Buffer.from([1, 0, 2])]);
+    expect(() => m.decodeWav(odd)).toThrow(/不是 2 的整数倍/);
+    const entry = makeEntry(odd, 2, { regions: [{ kind: 'speech', startSample: 0, endSample: 1 }] });
+    expect(m.checkFixtureEntry(entry, odd).join('\n')).toMatch(/WAV 解析失败.*不是 2 的整数倍/);
+  });
+
   it('findUnregisteredAudio:目录外 / 未登记 / 各种扩展名(大小写不敏感)', () => {
     const manifest = { fixtures: [{ file: 'ok.wav' }] };
     const errors = m.findUnregisteredAudio(
@@ -126,6 +134,15 @@ describe('仓库里的 committed 音频', () => {
     for (const entry of manifest.fixtures) {
       expect(tracked, `${entry.file} 登记了但未被 git 跟踪`).toContain(`${m.FIXTURE_DIR}/${entry.file}`);
       expect(m.checkFixtureEntry(entry, readFileSync(`${m.FIXTURE_DIR}/${entry.file}`))).toEqual([]);
+    }
+  });
+
+  it('README 的文件表与清单同步:每个 fixture 的文件名与 SHA 都出现在 README', () => {
+    const manifest = JSON.parse(readFileSync(m.MANIFEST, 'utf8'));
+    const readme = readFileSync(`${m.FIXTURE_DIR}/README.md`, 'utf8');
+    for (const entry of manifest.fixtures) {
+      expect(readme, `README 缺少 ${entry.file}`).toContain(`\`${entry.file}\``);
+      expect(readme, `README 缺少 ${entry.file} 的 SHA(重新生成后需同步)`).toContain(entry.sha256);
     }
   });
 });

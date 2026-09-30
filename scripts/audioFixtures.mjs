@@ -65,6 +65,8 @@ export function decodeWav(buf) {
     } else if (id === 'data') {
       if (!fmt) throw new Error('data chunk 出现在 fmt chunk 之前');
       if (body + len > buf.length) throw new Error('data chunk 越界');
+      // 只按 PCM16 解码:奇数长度意味着残缺样本,不能向下取整后当作合规文件
+      if (len % 2 !== 0) throw new Error(`data chunk 长度 ${len} 字节不是 2 的整数倍(残缺的 PCM16 样本)`);
       // 拷贝一份:Int16Array 要求 2 字节对齐
       const bytes = buf.subarray(body, body + len);
       const pcm = new Int16Array(Math.floor(len / 2));
