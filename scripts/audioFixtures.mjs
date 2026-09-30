@@ -128,6 +128,10 @@ export function checkFixtureEntry(entry, buf) {
   if (wav.format !== 1 || wav.channels !== 1 || wav.sampleRate !== SAMPLE_RATE || wav.bitsPerSample !== 16) {
     at(`格式须为 PCM / mono / ${SAMPLE_RATE}Hz / 16bit,实际 format=${wav.format} ch=${wav.channels} sr=${wav.sampleRate} bits=${wav.bitsPerSample}`);
   }
+  // 清单里记录的格式必须与文件头一致(README 要求登记格式;登记值不能是摆设)
+  for (const k of ['sampleRate', 'channels', 'bitsPerSample']) {
+    if (entry[k] !== wav[k]) at(`清单 ${k}=${entry[k]} 与文件头 ${wav[k]} 不符`);
+  }
 
   const regions = entry.regions ?? [];
   if (regions.length === 0) at('regions 为空');

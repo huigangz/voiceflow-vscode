@@ -91,6 +91,13 @@ describe('audioFixtures 纯函数', () => {
     const at8k = m.encodeWav(new Int16Array(100), 8000);
     expect(check({ sha256: m.sha256(at8k) }, at8k)).toMatch(/格式须为/);
 
+    // 文件合规,但清单登记的格式与文件头不符 → 逐字段报错
+    const meta = check({ sampleRate: 44100, channels: 2, bitsPerSample: 8 });
+    expect(meta).toMatch(/清单 sampleRate=44100 与文件头 16000 不符/);
+    expect(meta).toMatch(/清单 channels=2 与文件头 1 不符/);
+    expect(meta).toMatch(/清单 bitsPerSample=8 与文件头 16 不符/);
+    expect(check({ sampleRate: undefined as unknown as number })).toMatch(/清单 sampleRate=undefined/);
+
     expect(check({ source: { kind: 'personal-recording' } })).toMatch(/source\.kind 非法/);
     expect(check({ source: { kind: 'synthetic-tts', engine: 'SAPI' } })).toMatch(/source\.voice 缺失[\s\S]*source\.generator 缺失/);
     expect(check({ source: { kind: 'licensed', license: 'CC0-1.0' } })).toMatch(/source\.url 缺失/);
