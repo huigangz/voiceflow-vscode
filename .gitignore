@@ -9,6 +9,10 @@ dist/
 models/
 offline-model/
 *.wav
+# harness PR5:只放行可再分发的合成 fixture(来源 / SHA 见 test/fixtures/audio/fixtures.json,test/audioFixtures.test.ts 机检)
+!test/fixtures/audio/*.wav
+# 本地录音与质量测试结果(含个人语音),不入 git
+test-audio/
 worklog/
 test/fixtures/*.exe
 voiceflow-phase1-plan.md

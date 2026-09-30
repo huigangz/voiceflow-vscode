@@ -1,0 +1,46 @@
+{
+  "fixtures": [
+    {
+      "file": "speech-en-tts.wav",
+      "sha256": "f31964dadb50e91f02f5da30ddd29c7e6846aaa46624f8169d50a4aa01fda4c5",
+      "sampleRate": 16000,
+      "channels": 1,
+      "bitsPerSample": 16,
+      "source": {
+        "kind": "synthetic-tts",
+        "engine": "Windows SAPI 5 (System.Speech.Synthesis)",
+        "voice": "Microsoft Zira Desktop",
+        "generator": "scripts/gen-audio-fixtures.mjs"
+      },
+      "regions": [
+        {
+          "kind": "silence",
+          "startSample": 0,
+          "endSample": 16000
+        },
+        {
+          "kind": "speech",
+          "startSample": 16000,
+          "endSample": 73704,
+          "text": "Please review my pull request and merge it before the deadline tomorrow."
+        },
+        {
+          "kind": "silence",
+          "startSample": 73704,
+          "endSample": 105704
+        },
+        {
+          "kind": "speech",
+          "startSample": 105704,
+          "endSample": 170506,
+          "text": "The quick brown fox jumps over the lazy dog, then runs back home."
+        },
+        {
+          "kind": "silence",
+          "startSample": 170506,
+          "endSample": 186506
+        }
+      ]
+    }
+  ]
+}

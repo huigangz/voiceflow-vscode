@@ -18,11 +18,6 @@ import { pathToFileURL } from 'node:url';
 export const ALLOWED_SKIPS = [
   { file: 'test/addonRecorder.test.ts', describe: 'AddonRecorder(真设备)', why: '真实麦克风设备(CI runner 无音频输入)' },
   { file: 'test/helperRecorder.test.ts', describe: 'HelperRecorder(真实 helper 进程)', why: '真实麦克风 + bin/voiceflow-mic.exe(test job 不打包 bin/)' },
-  {
-    file: 'test/sileroVad.test.ts',
-    describe: 'SileroVad(真模型 + 本地语音样本)',
-    why: 'test-audio/ 含个人录音不入 git;harness PR5 换成可再分发 fixture 后删除本条',
-  },
 ];
 
 const SKIPPED = new Set(['skipped', 'pending', 'todo', 'disabled']);

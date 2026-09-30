@@ -56,7 +56,7 @@ Wispr Flow 式语音听写 VS Code extension(仅 Windows x64):按 `Ctrl+Alt+L` �
 - `src/ui/` — 状态栏、setup wizard
 <!-- /doc-check:src-layout -->
 
-其他:`test/`(vitest)、`scripts/`(构建 / 打包 / 校验脚本)、`bin.manifest.json`(二进制与运行时资产的 SHA 清单)、`.github/workflows/`(CI 与 release)。
+其他:`test/`(vitest;提交的音频只能放 `test/fixtures/audio/`,只允许合成 / 可再分发来源,登记在 `test/fixtures/audio/fixtures.json` 并由测试机检,规则见 `test/fixtures/audio/README.md`;本地录音放 `test-audio/` (local-only))、`scripts/`(构建 / 打包 / 校验脚本)、`bin.manifest.json`(二进制与运行时资产的 SHA 清单)、`.github/workflows/`(CI 与 release)。
 
 ## 会话状态机(`src/session.ts`)
 
@@ -81,6 +81,7 @@ Wispr Flow 式语音听写 VS Code extension(仅 Windows x64):按 `Ctrl+Alt+L` �
 - 二进制 `npm run bin`(place-helper + fetch-whisper + verify-bin)。
 - 打包 `npm run package`(standard);`npm run package:offline`(先 `npm run fetch-offline-models` 按钉死 revision 拉模型),`npm run package:bundled`(从本机 globalStorage 暂存模型后打 offline)。
 - 文档结构检查 `npm run verify-docs`(也在 `npm test` 里跑)。
+- 转写质量 / CER:`node scripts/quality-test.mjs`(本地,需麦克风;`--rerun` 用已有录音重跑),结果写 `test-audio/` (local-only);归一化与 CER 定义在 `scripts/cer.mjs`。
 - 发版:手动触发 `.github/workflows/release.yml` 产出两个 VSIX + SHA256SUMS(artifact),核对后**由人**创建 GitHub Release(pre-release,非 Marketplace)。版本号只改 `package.json`。
 
 ## 改动同步清单
