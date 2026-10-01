@@ -50,6 +50,8 @@ MIC-01、MIC-02、LC-01、LC-08、WP-02、SYS-01、INS-07、INS-11、INS-13、IN
 | LC-13 | inprocess 驻留上限 | `voiceflow.inprocess.maxResidentMinutes=1`,空闲等待;会话中再等一次 | 日志 `unloading (resident cap 1min)`;会话中为 pending unload,结束后卸载 | PASS(2026-07-06) |
 | LC-14 | 连续 20 次无泄漏 | server 模式连续听写 20 次 | whisper-server 内存稳定 | OPEN |
 | LC-15 | 状态栏 | 正常会话、出错、冷启动各一次 | 计时走动;阶段图标切换;错误图标点击打开 Output;下次会话重置;冷启动显示 "Loading model…" 后消失 | OPEN |
+| LC-16 | Esc 取消启动 / preflight | (a) `voiceflow.translate.target=off`,server 冷启动显示 "Loading model…" 时按 Esc;(b) target=off,inprocess 首次加载模型时按 Esc;(c) `voiceflow.translate.target=en`,Reload 后首次听写或 whisper 空闲卸载后,确认 Session 处于 preparing 且 preflight 仍在途时按 Esc;三种情况各在取消后再次听写 | 会话立即 idle;迟到的 recorder 不会激活且资源被释放;无文字插入、孤儿 whisper 进程或 unhandled rejection;下一次听写正常 | OPEN |
+| LC-17 | 已提交启动期间再次 toggle | `voiceflow.translate.target=off`,使用冷启动进入 `commitImmediately` 路径;Session UI 已显示 recording、模型加载仍在途时再次按 Ctrl+Alt+L | 保持现有 cancel-startup 行为;返回 idle,迟到的 recorder 不激活;下一次听写正常 | OPEN |
 
 ## 3. Windows 策略
 
